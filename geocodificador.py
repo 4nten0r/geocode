@@ -431,6 +431,19 @@ def carregar_base_ibge():
             pass
     return {}
 
+def eh_url_valida(url):
+    """Verifica se a URL é válida e não é apenas um placeholder de exemplo."""
+    if not url or not isinstance(url, str):
+        return False
+    u = url.strip()
+    if not (u.startswith("http://") or u.startswith("https://")):
+        return False
+    placeholders = ["SEU_USUARIO", "SEU_DATASET", "EXEMPLO", "YOUR_USER", "YOUR_DATASET"]
+    for p in placeholders:
+        if p.lower() in u.lower():
+            return False
+    return True
+
 def obter_url_secret_cnefe(estado):
     """Obtém a URL do CNEFE a partir do st.secrets ou variável de ambiente."""
     uf = normalizar_texto(estado).upper()[:2]
@@ -440,13 +453,15 @@ def obter_url_secret_cnefe(estado):
         if hasattr(st, "secrets"):
             for k in chaves:
                 if k in st.secrets:
-                    return str(st.secrets[k]).strip()
+                    val = str(st.secrets[k]).strip()
+                    if eh_url_valida(val):
+                        return val
     except Exception:
         pass
 
     for k in chaves:
         val = os.getenv(k)
-        if val and val.startswith("http"):
+        if val and eh_url_valida(val):
             return val.strip()
             
     return None
@@ -462,11 +477,11 @@ def obter_secret_google_maps():
 
 def localizar_parquet_estado(estado, url_remota=None):
     """Localiza o arquivo Parquet do CNEFE correspondente ao estado (local, URL do Secrets ou URL digitada)."""
-    if url_remota and url_remota.startswith("http"):
-        return url_remota
+    if url_remota and eh_url_valida(url_remota):
+        return url_remota.strip()
 
     url_secret = obter_url_secret_cnefe(estado)
-    if url_secret and url_secret.startswith("http"):
+    if url_secret and eh_url_valida(url_secret):
         return url_secret
 
     estado_limpo = normalizar_texto(estado).lower()[:2]
@@ -576,11 +591,14 @@ def carregar_e_indexar_cnefe(caminho_parquet, cods_ibge_unicos):
             """
         cnefe_df = con.execute(query).df()
     except Exception as e:
-        st.error(f"Erro ao ler Parquet CNEFE: {e}")
+        st.warning(f"⚠️ Não foi possível carregar a base CNEFE remota/local: {e}. O processamento continuará automaticamente pelos motores ArcGIS / Google Maps.")
         con.close()
         return {}
     finally:
-        con.close()
+        try:
+            con.close()
+        except Exception:
+            pass
 
     if cnefe_df.empty:
         return {}
