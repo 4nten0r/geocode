@@ -1,0 +1,31 @@
+# Ambientes virtuais
+.venv/
+venv/
+env/
+ENV/
+
+# Caches e temporários do Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+
+# Caches do Streamlit
+.streamlit/
+
+# Arquivos de dados pesados (>100MB bloqueados pelo GitHub)
+*.parquet
+*.csv
+*.duckdb
+*.db
+*.sqlite
+
+# Planilhas temporárias e de teste
+*.xlsx
+*.xls
+temp_entrada.xlsx
+teste_verificacao_saida.xlsx
+Coordenadas_Corrigidas_Final.xlsx
+
+# Arquivos temporários de teste
+gemini-code-*.py

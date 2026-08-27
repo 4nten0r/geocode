@@ -1,0 +1,7 @@
+streamlit>=1.44.0
+pandas>=2.2.0
+duckdb>=1.2.0
+rapidfuzz>=3.10.0
+geopy>=2.4.0
+openpyxl>=3.1.2
+requests>=2.31.0
