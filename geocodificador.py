@@ -319,12 +319,20 @@ def main():
     elif secret_cnefe_sp:
         st.sidebar.success("🌐 Base CNEFE Nuvem ativa via Streamlit Secrets!")
     else:
-        st.sidebar.warning("⚠️ Arquivo `cnefe_sp.parquet` não encontrado localmente.")
+        st.sidebar.warning("⚠️ Base CNEFE não detectada localmente.")
         url_cnefe_custom = st.sidebar.text_input(
-            "URL Remota CNEFE SP (opcional):",
+            "1. URL Remota CNEFE SP (Hugging Face / S3):",
             placeholder="https://.../cnefe_sp.parquet",
-            help="O DuckDB lerá o arquivo Parquet remotamente da nuvem (Hugging Face / S3 / GitHub Releases)."
+            help="O DuckDB lerá o arquivo Parquet remotamente da nuvem sem precisar baixar tudo."
         )
+        
+        cnefe_upload = st.sidebar.file_uploader("2. Ou envie o arquivo CNEFE (.parquet) aqui:", type=["parquet"])
+        if cnefe_upload is not None:
+            caminho_salvo = DIRETORIO_RAIZ / cnefe_upload.name
+            with open(caminho_salvo, "wb") as f:
+                f.write(cnefe_upload.getbuffer())
+            st.sidebar.success(f"✅ Base {cnefe_upload.name} carregada com sucesso!")
+            st.rerun()
 
     cache_geopy = carregar_cache_geopy()
     st.sidebar.info(f"💾 **Cache Geopy**: {len(cache_geopy)} endereços indexados.")
