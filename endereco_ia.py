@@ -1,15 +1,17 @@
 """
 Módulo de Inteligência e Limpeza de Endereços Brasileiros (endereco_ia.py)
-Aplica heurísticas, correção fonética/ortográfica e estruturação de dados de logradouros.
+Aplica IA heurística, correção fonética/ortográfica, estruturação de logradouros
+e motores de geocodificação de precisão (ArcGIS World Geocoder, Google Maps API e CNEFE).
 """
 
 import re
 import unicodedata
+import requests
 import pandas as pd
 from rapidfuzz import fuzz
 
 # ============================================================
-# DICIONÁRIOS DE EXPANSÃO E NORMALIZAÇÃO
+# DICIONÁRIOS DE EXPANSÃO E NORMALIZAÇÃO DE LOGRADOUROS
 # ============================================================
 
 PREFIXOS_EXPANSAO = {
@@ -24,7 +26,7 @@ PREFIXOS_EXPANSAO = {
     "CEL": "CORONEL", "CEL.": "CORONEL", "CORONEL": "CORONEL",
     "EST": "ESTRADA", "EST.": "ESTRADA", "ESTR": "ESTRADA", "ESTR.": "ESTRADA", "ESTRADA": "ESTRADA",
     "ROD": "RODOVIA", "ROD.": "RODOVIA", "RODOVIA": "RODOVIA",
-    "BR": "BARAO", "BR.": "BARAO", "BARAO": "BARAO",
+    "BR": "BARAO", "BR.": "BARAO", "BARAO": "BARAO", "BAR": "BARAO",
     "TEN": "TENENTE", "TEN.": "TENENTE", "TENENTE": "TENENTE",
     "MAJ": "MAJOR", "MAJ.": "MAJOR", "MAJOR": "MAJOR",
     "CAP": "CAPITAO", "CAP.": "CAPITAO", "CAPITAO": "CAPITAO",
@@ -34,6 +36,13 @@ PREFIXOS_EXPANSAO = {
     "PQ": "PARQUE", "PQ.": "PARQUE", "PARQUE": "PARQUE",
     "VL": "VILA", "VL.": "VILA", "VLA": "VILA", "VLA.": "VILA", "VILA": "VILA",
     "VIEL": "VIELA", "VIEL.": "VIELA", "VIELA": "VIELA",
+    "VE": "VEREADOR", "VE.": "VEREADOR", "VER": "VEREADOR", "VER.": "VEREADOR", "VR": "VEREADOR", "VEREADOR": "VEREADOR",
+    "DEP": "DEPUTADO", "DEP.": "DEPUTADO", "DEPUTADO": "DEPUTADO",
+    "SEN": "SENADOR", "SEN.": "SENADOR", "SENADOR": "SENADOR",
+    "DES": "DESEMBARGADOR", "DES.": "DESEMBARGADOR", "DESEMBARGADOR": "DESEMBARGADOR",
+    "PE": "PADRE", "PE.": "PADRE", "PADRE": "PADRE",
+    "PTO": "PREFEITO", "PTO.": "PREFEITO", "PREFEITO": "PREFEITO",
+    "ENG": "ENGENHEIRO", "ENG.": "ENGENHEIRO", "ENGENHEIRO": "ENGENHEIRO",
     "LOT": "LOTEAMENTO", "LOT.": "LOTEAMENTO", "LOTEAMENTO": "LOTEAMENTO",
     "CONJ": "CONJUNTO", "CONJ.": "CONJUNTO", "CONJUNTO": "CONJUNTO",
     "RES": "RESIDENCIAL", "RES.": "RESIDENCIAL", "RESIDENCIAL": "RESIDENCIAL",
@@ -41,6 +50,13 @@ PREFIXOS_EXPANSAO = {
     "PAS": "PASSEIO", "PAS.": "PASSEIO", "PASSEIO": "PASSEIO",
     "LRG": "LARGO", "LRG.": "LARGO", "LARGO": "LARGO",
     "SERV": "SERVIDAO", "SERV.": "SERVIDAO", "SERVIDAO": "SERVIDAO",
+}
+
+NUMEROS_EXTENSO = {
+    "01": "UM", "1": "UM", "02": "DOIS", "2": "DOIS", "03": "TRES", "3": "TRES",
+    "04": "QUATRO", "4": "QUATRO", "05": "CINCO", "5": "CINCO", "06": "SEIS", "6": "SEIS",
+    "07": "SETE", "7": "SETE", "08": "OITO", "8": "OITO", "09": "NOVE", "9": "NOVE",
+    "10": "DEZ", "11": "ONZE", "12": "DOZE", "13": "TREZE", "14": "QUATORZE", "15": "QUINZE"
 }
 
 CORRECOES_COMUNS = [
@@ -76,6 +92,7 @@ RUIDOS_REGEX = [
     r"\bCHACARA\s*\d*.*$",
     r"\bSITIO\s*\d*.*$",
     r"\bESQUINA\s+COM\b.*$",
+    r"\bESQ\.?\s+COM\b.*$",
     r"\bPERTO\s+(?:DE|DO|DA)?\b.*$",
     r"\bPROXIMO\s+(?:A|AO|DA)?\b.*$",
     r"\bCLINICA\b.*$",
@@ -91,11 +108,11 @@ TIPOS_LOGRADOURO_REGEX = re.compile(
 )
 
 # ============================================================
-# FUNÇÕES DE TRATAMENTO
+# FUNÇÕES DE TRATAMENTO E NORMALIZAÇÃO
 # ============================================================
 
 def normalizar_texto(valor):
-    """Remove acentos, caracteres especiais e padroniza em caixa alta."""
+    """Remove acentos, caracteres especiais corrompidos e padroniza em caixa alta."""
     if valor is None or pd.isna(valor):
         return ""
     t = str(valor).upper().strip()
@@ -108,10 +125,11 @@ def normalizar_texto(valor):
     return re.sub(r"\s+", " ", t).strip()
 
 def normalizar_municipio(valor):
-    """Limpa nome do município removendo siglas de estado agregadas (ex: SP-CAMPINAS)."""
+    """Limpa nome do município removendo siglas de estado agregadas (ex: SP-CAMPINAS -> CAMPINAS)."""
     t = normalizar_texto(valor)
     t = re.sub(r"^(SP|RJ|MG|PR|MS|GO|BA|ES|SC|RS|MT|PE|CE|PA|PB|AL|SE|RN|PI|MA|TO|RO|AC|AM|RR|AP|DF)[-_\s]+", "", t)
     t = re.sub(r"[-_\s]+(SP|RJ|MG|PR|MS|GO|BA|ES|SC|RS|MT|PE|CE|PA|PB|AL|SE|RN|PI|MA|TO|RO|AC|AM|RR|AP|DF)$", "", t)
+    t = re.sub(r"\((SP|RJ|MG|PR|MS|GO|BA|ES|SC|RS|MT|PE|CE|PA|PB|AL|SE|RN|PI|MA|TO|RO|AC|AM|RR|AP|DF)\)", "", t)
     return t.strip()
 
 def limpar_numero(valor):
@@ -119,7 +137,7 @@ def limpar_numero(valor):
     if valor is None or pd.isna(valor):
         return ""
     t = str(valor).strip()
-    if t.lower() in {"", "nan", "none", "null", "0", "0.0", "s/n", "sn", "s/nº", "sem numero", "sem nº"}:
+    if t.lower() in {"", "nan", "none", "null", "0", "0.0", "s/n", "sn", "s/nº", "sem numero", "sem nº", "00"}:
         return ""
     if re.fullmatch(r"\d+\.0", t):
         t = t[:-2]
@@ -132,7 +150,10 @@ def extrair_numero_endereco(rua, numero):
     """
     rua = normalizar_texto(rua)
     num = limpar_numero(numero)
+    
+    # Se número já veio informado, remove ruídos de dentro da rua
     if num:
+        rua = re.sub(rf"\b{re.escape(num)}\b", "", rua).strip(" ,-")
         return rua, num
 
     # Ex: '8 DE DEZEMBRO 600' -> '8 DE DEZEMBRO', '600'
@@ -176,14 +197,16 @@ def remover_complementos(texto):
     return re.sub(r"\s+", " ", t).strip(" ,-.")
 
 def expandir_prefixo(texto):
-    """Expande abreviações como 'R.', 'AV.', 'BR.', 'CEL.'."""
+    """Expande abreviações como 'R.', 'AV.', 'BR.', 'CEL.', 'VE.'."""
     t = texto.strip()
-    m = re.match(r"^([A-Z]{1,5}\.?)\s+(.+)$", t)
-    if m:
-        pref = m.group(1)
-        if pref in PREFIXOS_EXPANSAO:
-            return PREFIXOS_EXPANSAO[pref] + " " + m.group(2)
-    return t
+    tokens = t.split()
+    if not tokens:
+        return ""
+    if tokens[0] in PREFIXOS_EXPANSAO:
+        tokens[0] = PREFIXOS_EXPANSAO[tokens[0]]
+    if len(tokens) > 1 and tokens[1] in PREFIXOS_EXPANSAO:
+        tokens[1] = PREFIXOS_EXPANSAO[tokens[1]]
+    return " ".join(tokens)
 
 def sem_prefixo_tipo_rua(texto):
     """Retorna o nome do logradouro sem o tipo inicial (ex: 'RUA PAULISTA' -> 'PAULISTA')."""
@@ -223,12 +246,15 @@ def preparar_endereco(rua, numero):
         add(sem_conectivos)
         add(sem_prefixo_tipo_rua(sem_conectivos))
 
+    # Variantes com números por extenso
+    for num_digito, extenso in NUMEROS_EXTENSO.items():
+        if re.search(rf"\b{num_digito}\b", rua_sem_num):
+            add(re.sub(rf"\b{num_digito}\b", extenso, rua_sem_num))
+
     return {"rua": rua_sem_num, "numero": numero, "variantes": variantes}
 
 def calcular_similaridade(a, b):
-    """
-    Calcula score ponderado de similaridade entre duas strings usando C++ RapidFuzz.
-    """
+    """Calcula score ponderado de similaridade usando C++ RapidFuzz."""
     if not a or not b:
         return 0.0
     return (
@@ -237,13 +263,154 @@ def calcular_similaridade(a, b):
         0.30 * fuzz.WRatio(a, b)
     )
 
+# ============================================================
+# MOTORES DE GEOCODIFICAÇÃO DE ALTA PRECISÃO (ARCGIS & GOOGLE MAPS)
+# ============================================================
+
+def consultar_arcgis(rua_raw, num_raw, bairro_raw, mun_raw, uf_raw, session=None):
+    """
+    Consulta o ArcGIS World Geocoding Service (Esri).
+    Altíssima precisão no Brasil com suporte a números prediais (PointAddress)
+    e validação estrita anti-erro de cidade.
+    """
+    prep = preparar_endereco(rua_raw, num_raw)
+    rua = prep["rua"]
+    num = prep["numero"]
+    mun = normalizar_municipio(mun_raw)
+    uf = normalizar_texto(uf_raw)[:2] if uf_raw else "SP"
+    bairro = normalizar_texto(bairro_raw) if bairro_raw and bairro_raw not in ["(Não informado)", "CENTRO", "RURAL"] else ""
+
+    if not rua or not mun:
+        return None
+
+    consultas = []
+    if num:
+        if bairro:
+            consultas.append(f"{rua}, {num}, {bairro}, {mun}, {uf}, Brasil")
+        consultas.append(f"{rua}, {num}, {mun}, {uf}, Brasil")
+        consultas.append(f"{rua}, {num}, {mun}, Brasil")
+    
+    if bairro:
+        consultas.append(f"{rua}, {bairro}, {mun}, {uf}, Brasil")
+    consultas.append(f"{rua}, {mun}, {uf}, Brasil")
+    consultas.append(f"{rua}, {mun}, Brasil")
+
+    url = "https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates"
+    http = session or requests
+
+    for query_str in consultas:
+        params = {
+            "SingleLine": query_str,
+            "f": "json",
+            "outFields": "Match_addr,Addr_type,City,Subregion,Region,Postal",
+            "maxLocations": 3,
+            "countryCode": "BRA"
+        }
+        try:
+            r = http.get(url, params=params, timeout=6)
+            data = r.json()
+            candidates = data.get("candidates", [])
+            for cand in candidates:
+                score = cand.get("score", 0)
+                if score < 75:
+                    continue
+                attrs = cand.get("attributes", {})
+                addr_type = attrs.get("Addr_type", "")
+                city_ret = normalizar_municipio(attrs.get("City", ""))
+                subregion = normalizar_municipio(attrs.get("Subregion", ""))
+                loc = cand.get("location", {})
+                
+                # Validação Estrita de Cidade
+                sim_cidade = max(fuzz.token_sort_ratio(mun, city_ret), fuzz.token_sort_ratio(mun, subregion))
+                if sim_cidade < 70 and mun not in city_ret and city_ret not in mun:
+                    continue  # NUNCA aceita cidade errada!
+
+                lat, lon = loc.get("y"), loc.get("x")
+                if not lat or not lon:
+                    continue
+
+                if addr_type in ["PointAddress", "StreetAddress"]:
+                    return lat, lon, "✅ Exato (Número/Imóvel)", cand.get("address", "")
+                elif addr_type in ["StreetName", "StreetInt"]:
+                    return lat, lon, "✅ Logradouro (Rua)", cand.get("address", "")
+                elif addr_type in ["Locality", "Sublocality", "Neighborhood"] and bairro and fuzz.token_sort_ratio(bairro, addr_type) >= 70:
+                    return lat, lon, f"🟡 Bairro ({bairro})", cand.get("address", "")
+        except Exception:
+            pass
+
+    return None
+
+def consultar_google_maps(rua_raw, num_raw, bairro_raw, mun_raw, uf_raw, api_key, session=None):
+    """
+    Consulta a API oficial do Google Maps (Geocoding API).
+    Precisão máxima absoluta com resolução de coordenadas no telhado (ROOFTOP).
+    """
+    if not api_key:
+        return None
+
+    prep = preparar_endereco(rua_raw, num_raw)
+    rua = prep["rua"]
+    num = prep["numero"]
+    mun = normalizar_municipio(mun_raw)
+    uf = normalizar_texto(uf_raw)[:2] if uf_raw else "SP"
+    bairro = normalizar_texto(bairro_raw) if bairro_raw and bairro_raw not in ["(Não informado)", "CENTRO", "RURAL"] else ""
+
+    if not rua or not mun:
+        return None
+
+    endereco = f"{rua}, {num}".strip(" ,-") if num else rua
+    if bairro:
+        endereco += f", {bairro}"
+    endereco += f", {mun} - {uf}, Brasil"
+
+    url = "https://maps.googleapis.com/maps/api/geocode/json"
+    params = {
+        "address": endereco,
+        "key": api_key,
+        "language": "pt-BR",
+        "region": "br"
+    }
+    http = session or requests
+
+    try:
+        r = http.get(url, params=params, timeout=6)
+        data = r.json()
+        if data.get("status") == "OK" and data.get("results"):
+            res = data["results"][0]
+            loc = res.get("geometry", {}).get("location", {})
+            loc_type = res.get("geometry", {}).get("location_type", "")
+            tipos = set(res.get("types", []))
+            
+            # Validação estrita de cidade
+            cidade_ok = False
+            for comp in res.get("address_components", []):
+                comp_types = comp.get("types", [])
+                if "administrative_area_level_2" in comp_types or "locality" in comp_types:
+                    cidade_cand = normalizar_municipio(comp.get("long_name", ""))
+                    if fuzz.token_sort_ratio(mun, cidade_cand) >= 70 or mun in cidade_cand or cidade_cand in mun:
+                        cidade_ok = True
+                        break
+
+            if not cidade_ok:
+                return None  # Rejeita se cidade divergente
+
+            lat = loc.get("lat")
+            lon = loc.get("lng")
+            match_addr = res.get("formatted_address", "")
+
+            if loc_type == "ROOFTOP" or ("street_number" in tipos) or ("premise" in tipos):
+                return lat, lon, "✅ Google Maps Exato (Número)", match_addr
+            elif loc_type in ["RANGE_INTERPOLATED", "GEOMETRIC_CENTER"] and "route" in tipos:
+                return lat, lon, "✅ Google Maps Logradouro (Rua)", match_addr
+            elif "sublocality" in tipos or "neighborhood" in tipos:
+                return lat, lon, "🟡 Google Maps Bairro", match_addr
+    except Exception:
+        pass
+
+    return None
+
 def validar_resposta_geopy(loc, mun_esperado, uf_esperada, num_esperado=None):
-    """
-    Valida rigorosamente a resposta do Geopy / Nominatim:
-    1. Garante que a cidade e estado coincidem com o esperado (NUNCA erra a cidade).
-    2. Rejeita Centro da Cidade / polígonos municipais genéricos.
-    3. Retorna (lat, lon, status_precisao) ou None se não atender ao padrão de qualidade.
-    """
+    """Valida rigorosamente a resposta do Geopy / Nominatim."""
     if not loc or not hasattr(loc, 'raw'):
         return None
 
@@ -253,7 +420,7 @@ def validar_resposta_geopy(loc, mun_esperado, uf_esperada, num_esperado=None):
     obj_type = str(raw.get('type', '')).lower()
     obj_class = str(raw.get('class', '')).lower()
 
-    # 1. Validação Estrita de Cidade (NUNCA aceitar cidade divergente)
+    # 1. Validação Estrita de Cidade
     cidade_retornada = (
         addr.get('city') or 
         addr.get('town') or 
@@ -269,31 +436,27 @@ def validar_resposta_geopy(loc, mun_esperado, uf_esperada, num_esperado=None):
     
     if mun_esp and mun_ret:
         sim_cidade = fuzz.token_sort_ratio(mun_esp, mun_ret)
-        if sim_cidade < 75 and mun_esp not in mun_ret and mun_ret not in mun_esp:
-            return None  # Rejeita para não atribuir coordenadas em município incorreto
+        if sim_cidade < 70 and mun_esp not in mun_ret and mun_ret not in mun_esp:
+            return None
 
-    # 2. Rejeitar Centro da Cidade / Município Genérico (Exigir ao menos Rua ou Bairro)
+    # 2. Rejeitar Centro da Cidade / Município Genérico
     tipos_cidade_pura = {'municipality', 'city', 'town', 'village', 'state', 'administrative', 'country', 'county'}
     tem_rua = bool(addr.get('road') or addresstype in {'road', 'street', 'highway'})
     tem_bairro = bool(addr.get('suburb') or addr.get('neighbourhood') or addresstype in {'suburb', 'neighbourhood'})
     tem_numero = bool(addr.get('house_number') or addresstype in {'house', 'building'})
 
     if (addresstype in tipos_cidade_pura or obj_type in tipos_cidade_pura or obj_class == 'boundary') and not (tem_rua or tem_bairro or tem_numero):
-        return None  # Rejeita: Retornou apenas centróide de cidade
+        return None
 
     lat = float(loc.latitude)
     lon = float(loc.longitude)
 
-    # 3. Classificação de Precisão
     if tem_numero or (num_esperado and addr.get('house_number') and str(num_esperado).strip() == str(addr.get('house_number')).strip()):
-        return lat, lon, "✅ Geopy Exato (Número)"
-        
+        return lat, lon, "✅ Nominatim Exato (Número)"
     if tem_rua:
-        return lat, lon, "✅ Geopy Logradouro (Rua)"
-        
+        return lat, lon, "✅ Nominatim Logradouro (Rua)"
     if tem_bairro:
         bairro_nome = addr.get('suburb') or addr.get('neighbourhood') or ''
-        return lat, lon, f"🟡 Geopy Bairro ({bairro_nome})" if bairro_nome else "🟡 Geopy Bairro"
+        return lat, lon, f"🟡 Nominatim Bairro ({bairro_nome})" if bairro_nome else "🟡 Nominatim Bairro"
 
     return None
-

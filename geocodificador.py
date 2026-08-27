@@ -1,7 +1,7 @@
 """
 Geocodificador Inteligente de Alta Performance
-Integração CNEFE (IBGE 2022) via DuckDB/Parquet + IA/Heurística de Endereços + Fallback Geopy
-Foco: Precisão Estrita (Número / Rua / Bairro) - Rejeição total de Centro de Cidade e cidades divergentes.
+Integração CNEFE (IBGE 2022) via DuckDB/Parquet + ArcGIS World Geocoder + Google Maps API + IA de Endereços
+Foco: Precisão Estrita Nível Google Maps (Número / Rua / Bairro) - Rejeição total de centróides de cidade.
 """
 
 import os
@@ -10,6 +10,8 @@ import time
 import json
 import re
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+import requests
 
 # Garante que o diretório onde o script está localizado esteja no sys.path (essencial para Streamlit Cloud)
 DIRETORIO_RAIZ = Path(__file__).resolve().parent
@@ -23,7 +25,7 @@ from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderRateLimited, GeocoderTimedOut, GeocoderServiceError
 import streamlit as st
 
-# Importa o módulo de inteligência de endereços
+# Importa o módulo de inteligência de endereços e motores de alta precisão
 from endereco_ia import (
     normalizar_texto,
     normalizar_municipio,
@@ -32,6 +34,8 @@ from endereco_ia import (
     preparar_endereco,
     sem_prefixo_tipo_rua,
     calcular_similaridade,
+    consultar_arcgis,
+    consultar_google_maps,
     validar_resposta_geopy
 )
 
@@ -40,7 +44,7 @@ from endereco_ia import (
 # ============================================================
 ARQUIVO_IBGE_MUNICIPIOS = str(DIRETORIO_RAIZ / "ibge_municipios.json")
 CACHE_GEOPY_ARQUIVO = str(DIRETORIO_RAIZ / "cache_geopy.json")
-NOMINATIM_USER_AGENT = "GeocodificadorIA_IBGE_Turbo/8.0"
+NOMINATIM_USER_AGENT = "GeocodificadorIA_IBGE_Turbo/8.5"
 DEFAULT_SCORE_CUTOFF = 75
 
 # ============================================================
@@ -59,18 +63,14 @@ def carregar_base_ibge():
     return {}
 
 def carregar_cache_geopy():
-    """Carrega o cache unificado de geocodificação externa."""
-    cache = {}
-    for arquivo in [CACHE_GEOPY_ARQUIVO, str(DIRETORIO_RAIZ / "cache_geopy_v2.json")]:
-        p = Path(arquivo)
-        if p.exists():
-            try:
-                with open(p, "r", encoding="utf-8") as f:
-                    dados = json.load(f)
-                    cache.update(dados)
-            except Exception:
-                pass
-    return cache
+    """Carrega o cache de geocodificação offline."""
+    if Path(CACHE_GEOPY_ARQUIVO).exists():
+        try:
+            with open(CACHE_GEOPY_ARQUIVO, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
 
 def salvar_cache_geopy(cache):
     """Salva o cache em disco de forma segura."""
@@ -100,22 +100,30 @@ def obter_url_secret_cnefe(estado):
             
     return None
 
+def obter_secret_google_maps():
+    """Obtém a chave de API do Google Maps dos Secrets ou variáveis de ambiente."""
+    try:
+        if hasattr(st, "secrets") and "GOOGLE_MAPS_API_KEY" in st.secrets:
+            return str(st.secrets["GOOGLE_MAPS_API_KEY"]).strip()
+    except Exception:
+        pass
+    return os.getenv("GOOGLE_MAPS_API_KEY", "").strip()
+
 def localizar_parquet_estado(estado, url_remota=None):
     """Localiza o arquivo Parquet do CNEFE correspondente ao estado (local, URL do Secrets ou URL digitada)."""
-    # 1. URL digitada na interface
     if url_remota and url_remota.startswith("http"):
         return url_remota
 
-    # 2. URL configurada no Streamlit Secrets / Env
     url_secret = obter_url_secret_cnefe(estado)
     if url_secret and url_secret.startswith("http"):
         return url_secret
 
-    # 3. Arquivo local no disco
     estado_limpo = normalizar_texto(estado).lower()[:2]
     candidatos = [
+        DIRETORIO_RAIZ / f"cnefe_{estado_limpo}_compacto.parquet",
         DIRETORIO_RAIZ / f"cnefe_{estado_limpo}.parquet",
         DIRETORIO_RAIZ / f"cnefe_{estado_limpo.upper()}.parquet",
+        Path(f"cnefe_{estado_limpo}_compacto.parquet"),
         Path(f"cnefe_{estado_limpo}.parquet"),
         Path(f"cnefe_{estado_limpo.upper()}.parquet")
     ]
@@ -146,55 +154,85 @@ def resolver_codigos_ibge(df, col_mun, col_uf, ibge_base):
             continue
             
         uf_dict = ibge_base.get(uf, ibge_sp)
-        cod = uf_dict.get(mun_raw)
-        
-        if not cod and mun_raw and uf_dict:
-            # Match fuzzy de alta velocidade no nome da cidade
-            match = process.extractOne(mun_raw, list(uf_dict.keys()), scorer=fuzz.token_sort_ratio)
-            if match and match[1] >= 80:
-                cod = uf_dict[match[0]]
-                
-        cache_mun_match[chave] = cod
-        cods_ibge.append(cod)
-        
+        if not uf_dict:
+            cods_ibge.append(None)
+            cache_mun_match[chave] = None
+            continue
+
+        # 1. Match direto exato
+        if mun_raw in uf_dict:
+            cod = uf_dict[mun_raw]
+            cods_ibge.append(cod)
+            cache_mun_match[chave] = cod
+            continue
+
+        # 2. Match Fuzzy
+        match = process.extractOne(
+            mun_raw,
+            list(uf_dict.keys()),
+            scorer=fuzz.token_sort_ratio,
+            score_cutoff=78
+        )
+        if match:
+            cod = uf_dict[match[0]]
+            cods_ibge.append(cod)
+            cache_mun_match[chave] = cod
+        else:
+            cods_ibge.append(None)
+            cache_mun_match[chave] = None
+
     return cods_ibge
 
-def carregar_e_indexar_cnefe(parquet_source, cods_ibge):
-    """
-    Executa consulta vetorial única no DuckDB e monta o índice em memória
-    para busca de ruas e números prediais em tempo O(1).
-    """
-    cods_validos = [str(int(c)) for c in set(cods_ibge) if c is not None and not pd.isna(c)]
+@st.cache_data(show_spinner=False)
+def carregar_e_indexar_cnefe(caminho_parquet, cods_ibge_unicos):
+    """Carrega dados do CNEFE filtrados para os municípios do lote e cria índice hash em memória."""
+    cods_validos = [str(c) for c in cods_ibge_unicos if c and not pd.isna(c)]
     if not cods_validos:
         return {}
 
-    cods_sql = ", ".join(cods_validos)
-    
-    con = duckdb.connect(database=":memory:")
-    # Ativa httpfs se for URL remota (ex: Streamlit Cloud lendo S3/HuggingFace)
-    if parquet_source.startswith("http"):
-        con.execute("INSTALL httpfs; LOAD httpfs;")
-    
-    parquet_escaped = parquet_source.replace("'", "''")
-    query = f"""
-        SELECT 
-            COD_MUNICIPIO,
-            TRIM(COALESCE(NOM_TIPO_SEGLOGR, '') || ' ' || COALESCE(NOM_TITULO_SEGLOGR, '') || ' ' || COALESCE(NOM_SEGLOGR, '')) AS NOM_LOGRADOURO,
-            NUM_ENDERECO,
-            LATITUDE,
-            LONGITUDE,
-            CEP
-        FROM read_parquet('{parquet_escaped}')
-        WHERE COD_MUNICIPIO IN ({cods_sql})
-    """
+    in_clause = ",".join(cods_validos)
+    con = duckdb.connect()
     try:
+        con.execute("INSTALL httpfs; LOAD httpfs;")
+    except Exception:
+        pass
+
+    try:
+        # Detecta se é o parquet compacto ou completo
+        con.execute(f"DESCRIBE SELECT * FROM read_parquet('{caminho_parquet}') LIMIT 1;")
+        colunas_parquet = [row[0] for row in con.fetchall()]
+        
+        if 'NOM_LOGRADOURO' in colunas_parquet:
+            query = f"""
+                SELECT 
+                    CAST(COD_MUNICIPIO AS INTEGER) AS COD_MUNICIPIO,
+                    NOM_LOGRADOURO,
+                    CAST(NUM_ENDERECO AS VARCHAR) AS NUM_ENDERECO,
+                    LATITUDE,
+                    LONGITUDE,
+                    CEP
+                FROM read_parquet('{caminho_parquet}')
+                WHERE CAST(COD_MUNICIPIO AS VARCHAR) IN ({in_clause})
+            """
+        else:
+            query = f"""
+                SELECT 
+                    CAST(COD_MUNICIPIO AS INTEGER) AS COD_MUNICIPIO,
+                    TRIM(COALESCE(NOM_TIPO_SEGLOGR, '') || ' ' || COALESCE(NOM_TITULO_SEGLOGR, '') || ' ' || COALESCE(NOM_SEGLOGR, '')) AS NOM_LOGRADOURO,
+                    CAST(NUM_ENDERECO AS VARCHAR) AS NUM_ENDERECO,
+                    LATITUDE,
+                    LONGITUDE,
+                    CEP
+                FROM read_parquet('{caminho_parquet}')
+                WHERE CAST(COD_MUNICIPIO AS VARCHAR) IN ({in_clause})
+            """
         cnefe_df = con.execute(query).df()
     except Exception as e:
-        st.error(f"Erro ao ler CNEFE de '{parquet_source}': {e}")
+        st.error(f"Erro ao ler Parquet CNEFE: {e}")
         con.close()
         return {}
-        
-    con.close()
+    finally:
+        con.close()
 
     if cnefe_df.empty:
         return {}
@@ -222,9 +260,7 @@ def carregar_e_indexar_cnefe(parquet_source, cods_ibge):
     return cnefe_index
 
 def buscar_endereco_no_indice(consulta, mun_cod, cnefe_index, score_cutoff=DEFAULT_SCORE_CUTOFF):
-    """
-    Realiza a correspondência do endereço (exata ou fuzzy) contra o índice em memória.
-    """
+    """Realiza a correspondência do endereço (exata ou fuzzy) contra o índice em memória."""
     if mun_cod not in cnefe_index:
         return None
 
@@ -235,7 +271,7 @@ def buscar_endereco_no_indice(consulta, mun_cod, cnefe_index, score_cutoff=DEFAU
     if not consulta["rua"] or not ruas_list:
         return None
 
-    # 1. Tentativa de correspondência exata O(1)
+    # 1. Correspondência exata O(1)
     candidatos = {}
     for v in consulta["variantes"]:
         if v in ruas_dict:
@@ -266,21 +302,20 @@ def buscar_endereco_no_indice(consulta, mun_cod, cnefe_index, score_cutoff=DEFAU
             score = score_base
             num_cand = r['NUM_NORM']
             
-            # Bônus para correspondência exata do número predial
             if num_busca and num_cand and num_busca == num_cand:
                 score += 15
 
             if score > melhor_score:
                 melhor_score = score
                 melhor_row = r
-                if score >= 115:  # Match perfeito de rua e número
+                if score >= 115:
                     break
         if melhor_score >= 115:
             break
 
     if melhor_row is not None and melhor_score >= score_cutoff:
         exato = bool(num_busca) and melhor_row['NUM_NORM'] == num_busca
-        status = "✅ CNEFE Exato" if exato else "✅ CNEFE Logradouro"
+        status = "✅ CNEFE Exato (Número)" if exato else "✅ CNEFE Logradouro (Rua)"
         return float(melhor_row['LATITUDE']), float(melhor_row['LONGITUDE']), status
 
     return None
@@ -291,26 +326,37 @@ def buscar_endereco_no_indice(consulta, mun_cod, cnefe_index, score_cutoff=DEFAU
 
 def main():
     st.set_page_config(
-        page_title="Geocodificador IA Turbo",
+        page_title="Geocodificador IA Turbo - Nível Google Maps",
         page_icon="🌍",
         layout="wide"
     )
 
     st.title("🌍 Geocodificador IA Turbo")
     st.markdown("""
-    **Motor de Geocodificação Estrita (Número / Rua / Bairro)**:
-    - 🏢 **CNEFE IBGE 2022**: Coordenadas prediais e de face de quadra locais/remotas via DuckDB + RapidFuzz.
-    - 🛡️ **Garantia Anti-Centro de Cidade**: Rejeita polígonos municipais genéricos para assegurar precisão de logradouro.
-    - 🔒 **Validação Estrita de Cidade**: Nunca atribui coordenadas fora do município de destino.
+    **Motor Multi-Camadas de Alta Precisão (Nível Google Maps)**:
+    - 🏢 **Camada 1: CNEFE IBGE 2022**: Busca ultrarrápida vetorial em memória via DuckDB e RapidFuzz.
+    - 🗺️ **Camada 2: Google Maps API**: Precisão máxima de coordenadas prediais no telhado (opcional).
+    - 🌐 **Camada 3: ArcGIS World Geocoder (Esri)**: Geocodificador empresarial com localização exata de número predial e rua.
+    - 🛡️ **Garantia Anti-Erro**: Rejeição estrita de centróides de cidade e validação de município de destino.
     """)
 
     # Sidebar
     st.sidebar.header("⚙️ Configurações de Precisão")
-    limiar_score = st.sidebar.slider("Limiar de Similaridade de Logradouro (%)", min_value=60, max_value=95, value=75, step=1)
-    geopy_delay = st.sidebar.slider("Delay Nominatim Fallback (segundos)", min_value=1.0, max_value=5.0, value=2.0, step=0.5)
+    limiar_score = st.sidebar.slider("Limiar de Similaridade CNEFE (%)", min_value=60, max_value=95, value=75, step=1)
+    
+    st.sidebar.header("🗺️ Chave Google Maps (Opcional)")
+    secret_google_key = obter_secret_google_maps()
+    google_api_key = st.sidebar.text_input(
+        "Chave Google Maps API (Nível Máximo):",
+        value=secret_google_key,
+        type="password",
+        help="Se fornecida, consulta a API oficial do Google Maps com precisão ROOFTOP."
+    )
+    if google_api_key:
+        st.sidebar.success("🔑 Google Maps API configurada!")
 
     st.sidebar.header("📁 Base de Dados CNEFE (IBGE)")
-    tem_cnefe_local = (DIRETORIO_RAIZ / "cnefe_sp.parquet").exists() or (DIRETORIO_RAIZ / "cnefe_rj.parquet").exists() or Path("cnefe_sp.parquet").exists()
+    tem_cnefe_local = (DIRETORIO_RAIZ / "cnefe_sp_compacto.parquet").exists() or (DIRETORIO_RAIZ / "cnefe_sp.parquet").exists() or (DIRETORIO_RAIZ / "cnefe_rj.parquet").exists() or Path("cnefe_sp.parquet").exists()
     secret_cnefe_sp = obter_url_secret_cnefe("SP")
     
     url_cnefe_custom = None
@@ -335,7 +381,7 @@ def main():
             st.rerun()
 
     cache_geopy = carregar_cache_geopy()
-    st.sidebar.info(f"💾 **Cache Geopy**: {len(cache_geopy)} endereços indexados.")
+    st.sidebar.info(f"💾 **Cache Offline**: {len(cache_geopy)} endereços indexados.")
 
     ibge_base = carregar_base_ibge()
     if not ibge_base:
@@ -370,34 +416,42 @@ def main():
             for i, c in enumerate(colunas):
                 for op in opcoes:
                     if op.lower() in str(c).lower():
-                        return i + 1  # +1 por causa do '(Não informado)'
+                        return i + 1
             return 0
 
         st.subheader("📋 Mapeamento de Colunas")
         c1, c2, c3, c4, c5, c6 = st.columns(6)
         with c1:
-            col_rua = st.selectbox("Logradouro / Rua *", colunas, index=detectar_col(["rua", "logradouro", "endereco"]))
+            idx_rua = detectar_col(["rua", "logradouro", "endereco", "end"])
+            col_rua = st.selectbox("Logradouro / Rua*", colunas, index=idx_rua)
         with c2:
-            sel_num = st.selectbox("Número", opcoes_com_nenhum, index=detectar_col_opcional(["numero", "num", "nº"]))
-            col_num = None if sel_num == "(Não informado)" else sel_num
+            idx_num = detectar_col_opcional(["numero", "num", "nº", "n"])
+            col_num_escolha = st.selectbox("Número", opcoes_com_nenhum, index=idx_num)
+            col_num = None if col_num_escolha == "(Não informado)" else col_num_escolha
         with c3:
-            sel_bairro = st.selectbox("Bairro", opcoes_com_nenhum, index=detectar_col_opcional(["bairro"]))
-            col_bairro = None if sel_bairro == "(Não informado)" else sel_bairro
+            idx_bairro = detectar_col_opcional(["bairro", "bair", "distrito"])
+            col_bairro_escolha = st.selectbox("Bairro", opcoes_com_nenhum, index=idx_bairro)
+            col_bairro = None if col_bairro_escolha == "(Não informado)" else col_bairro_escolha
         with c4:
-            sel_cep = st.selectbox("CEP", opcoes_com_nenhum, index=detectar_col_opcional(["cep"]))
-            col_cep = None if sel_cep == "(Não informado)" else sel_cep
+            idx_cep = detectar_col_opcional(["cep", "codigo postal"])
+            col_cep_escolha = st.selectbox("CEP", opcoes_com_nenhum, index=idx_cep)
+            col_cep = None if col_cep_escolha == "(Não informado)" else col_cep_escolha
         with c5:
-            col_mun = st.selectbox("Município *", colunas, index=detectar_col(["municipio", "cidade"]))
+            idx_mun = detectar_col(["municipio", "cidade", "mun", "cid"])
+            col_mun = st.selectbox("Município*", colunas, index=idx_mun)
         with c6:
-            sel_uf = st.selectbox("Estado / UF", opcoes_com_nenhum, index=detectar_col_opcional(["estado", "uf"]))
-            col_uf = None if sel_uf == "(Não informado)" else sel_uf
+            idx_uf = detectar_col_opcional(["uf", "estado", "est"])
+            col_uf_escolha = st.selectbox("UF / Estado", opcoes_com_nenhum, index=idx_uf)
+            col_uf = None if col_uf_escolha == "(Não informado)" else col_uf_escolha
 
-        # Exibe preview sem colunas duplicadas
-        cols_para_exibir = list(dict.fromkeys([c for c in [col_rua, col_num, col_bairro, col_cep, col_mun, col_uf] if c and c in df.columns]))
-        with st.expander("🔍 Pré-visualizar dados carregados"):
-            st.dataframe(df[cols_para_exibir].head(10))
+        # Visualização prévia dos dados mapeados
+        cols_preview = [c for c in [col_rua, col_num, col_bairro, col_cep, col_mun, col_uf] if c]
+        # Remove eventuais duplicidades mantendo a ordem
+        cols_preview_unicas = list(dict.fromkeys(cols_preview))
+        st.dataframe(df[cols_preview_unicas].head(10))
 
-        if st.button("🚀 Iniciar Geocodificação Turbo", type="primary"):
+        # Botão de Execução
+        if st.button("🚀 Iniciar Geocodificação de Alta Precisão", type="primary"):
             t_inicio = time.time()
             total = len(df)
             lats = [""] * total
@@ -408,9 +462,9 @@ def main():
             m_col1, m_col2, m_col3, m_col4, m_col5, m_col6 = st.columns(6)
             m_total = m_col1.metric("Total", f"{total}")
             m_cnefe_exato = m_col2.metric("CNEFE Exato", "0")
-            m_cnefe_rua = m_col3.metric("CNEFE Logradouro", "0")
-            m_geopy_exato = m_col4.metric("Geopy Exato/Rua", "0")
-            m_geopy_bairro = m_col5.metric("Geopy Bairro", "0")
+            m_cnefe_rua = m_col3.metric("CNEFE Rua", "0")
+            m_web_exato = m_col4.metric("ArcGIS/Google Exato", "0")
+            m_web_rua = m_col5.metric("ArcGIS/Google Rua", "0")
             m_falha = m_col6.metric("Não Encontrado", "0")
 
             barra_progresso = st.progress(0, text="🔍 Mapeando códigos de municípios pelo IBGE...")
@@ -431,11 +485,6 @@ def main():
                     barra_progresso.progress(10, text=f"⚡ Carregando base CNEFE ({uf}) com DuckDB em memória...")
                     idx_uf = carregar_e_indexar_cnefe(parquet_path, cods_ibge)
                     cnefe_indices_por_uf[uf] = idx_uf
-
-            if cnefe_indices_por_uf:
-                barra_progresso.progress(25, text="⚡ Executando varredura rápida CNEFE com IA e RapidFuzz C++...")
-            else:
-                st.info("ℹ️ Base CNEFE local não disponível. Prosseguindo diretamente com motor de Geocodificação Estrita...")
 
             # Passo 2: Executar matching CNEFE
             cnefe_exato_count = 0
@@ -467,139 +516,104 @@ def main():
                     indices_pendentes.append(i)
 
                 if (i + 1) % 100 == 0 or (i + 1) == total:
-                    prog = 25 + int(((i + 1) / total) * 35)
+                    prog = int(((i + 1) / total) * 35)
                     barra_progresso.progress(prog, text=f"⚡ CNEFE: {i + 1}/{total} processados...")
                     m_cnefe_exato.metric("CNEFE Exato", f"{cnefe_exato_count}")
-                    m_cnefe_rua.metric("CNEFE Logradouro", f"{cnefe_rua_count}")
+                    m_cnefe_rua.metric("CNEFE Rua", f"{cnefe_rua_count}")
 
-            # Passo 3: Fallback Geopy Estrito para os não encontrados
-            geopy_rua_count = 0
-            geopy_bairro_count = 0
+            # Passo 3: Motores de Alta Precisão (Google Maps / ArcGIS World Geocoder)
+            web_exato_count = 0
+            web_rua_count = 0
             falhas_count = 0
             total_pendentes = len(indices_pendentes)
 
             if total_pendentes > 0:
-                barra_progresso.progress(60, text=f"🌍 Iniciando fallback Geopy Estrito para {total_pendentes} endereços...")
-                geolocator = Nominatim(user_agent=NOMINATIM_USER_AGENT, timeout=15)
+                barra_progresso.progress(40, text=f"🌍 Geocodificando {total_pendentes} endereços pendentes com precisão Google Maps / ArcGIS...")
+                session = requests.Session()
 
-                for k, idx in enumerate(indices_pendentes):
+                def processar_item_web(idx):
                     row = df.iloc[idx]
+                    rua_val = row.get(col_rua, "")
                     num_val = row.get(col_num, "") if col_num else ""
-                    rua_prep = preparar_endereco(row.get(col_rua, ""), num_val)
-                    rua = rua_prep["rua"]
-                    num = rua_prep["numero"]
-                    mun = normalizar_municipio(row.get(col_mun, ""))
-                    uf = normalizar_texto(row.get(col_uf, "SP"))[:2] if col_uf else "SP"
-                    bairro = normalizar_texto(row.get(col_bairro, "")) if col_bairro else ""
+                    bairro_val = row.get(col_bairro, "") if col_bairro else ""
+                    mun_val = row.get(col_mun, "")
+                    uf_val = row.get(col_uf, "SP") if col_uf else "SP"
 
-                    consultas = [
-                        {"street": f"{num} {rua}".strip() if num else rua, "city": mun, "state": uf, "country": "Brasil"},
-                        f"{rua}, {num}, {bairro}, {mun}, {uf}, Brasil" if bairro and num else f"{rua}, {num}, {mun}, {uf}, Brasil" if num else f"{rua}, {mun}, {uf}, Brasil",
-                        f"{rua}, {mun}, {uf}, Brasil",
-                        f"{bairro}, {mun}, {uf}, Brasil" if bairro else None
-                    ]
-                    consultas = [c for c in consultas if c is not None]
+                    # 1. Tenta Google Maps API se chave fornecida
+                    if google_api_key:
+                        res_google = consultar_google_maps(rua_val, num_val, bairro_val, mun_val, uf_val, google_api_key, session=session)
+                        if res_google:
+                            lat, lon, st_p, match_addr = res_google
+                            return idx, lat, lon, st_p
 
-                    encontrou = False
-                    for consulta in consultas:
-                        chave = json.dumps(consulta, ensure_ascii=False, sort_keys=True)
-                        if chave in cache_geopy:
-                            cached = cache_geopy[chave]
-                            if cached and len(cached) >= 3:
-                                lats[idx], lons[idx] = cached[0], cached[1]
-                                status_list[idx] = cached[2] + " (Cache)"
-                                encontrou = True
-                                if "Bairro" in cached[2]:
-                                    geopy_bairro_count += 1
-                                else:
-                                    geopy_rua_count += 1
-                                break
-                            elif cached and len(cached) == 2:
-                                lats[idx], lons[idx] = cached[0], cached[1]
-                                status_list[idx] = "✅ Geopy (Cache)"
-                                encontrou = True
-                                geopy_rua_count += 1
-                                break
-                            continue
+                    # 2. Tenta ArcGIS World Geocoder (Alta precisão com número predial)
+                    res_arc = consultar_arcgis(rua_val, num_val, bairro_val, mun_val, uf_val, session=session)
+                    if res_arc:
+                        lat, lon, st_p, match_addr = res_arc
+                        return idx, lat, lon, st_p
 
-                        # Requisição online segura com validação rigorosa
-                        for tentativa in range(3):
-                            try:
-                                loc = geolocator.geocode(consulta, addressdetails=True)
-                                time.sleep(geopy_delay)
-                                
-                                # Validação estrita: Rejeita centro de cidade e cidades erradas
-                                validado = validar_resposta_geopy(loc, mun, uf, num_esperado=num)
-                                if validado:
-                                    lat_val, lon_val, st_val = validado
-                                    lats[idx], lons[idx] = lat_val, lon_val
-                                    status_list[idx] = st_val
-                                    cache_geopy[chave] = [lat_val, lon_val, st_val]
-                                    encontrou = True
-                                    if "Bairro" in st_val:
-                                        geopy_bairro_count += 1
-                                    else:
-                                        geopy_rua_count += 1
-                                else:
-                                    cache_geopy[chave] = None
-                                break
-                            except GeocoderRateLimited:
-                                time.sleep(15.0)
-                            except (GeocoderTimedOut, GeocoderServiceError):
-                                time.sleep(geopy_delay)
-                                break
-                            except Exception:
-                                break
+                    return idx, None, None, None
 
-                        if encontrou:
-                            break
+                # Executa em paralelo com 6 threads
+                with ThreadPoolExecutor(max_workers=6) as executor:
+                    futuros = [executor.submit(processar_item_web, idx) for idx in indices_pendentes]
+                    for count, fut in enumerate(futuros, 1):
+                        idx, lat_val, lon_val, st_val = fut.result()
+                        if lat_val and lon_val:
+                            lats[idx] = lat_val
+                            lons[idx] = lon_val
+                            status_list[idx] = st_val
+                            if "Exato" in st_val:
+                                web_exato_count += 1
+                            else:
+                                web_rua_count += 1
+                        else:
+                            status_list[idx] = "❌ Não Encontrado (Sem precisão de rua)"
+                            falhas_count += 1
 
-                    if not encontrou:
-                        status_list[idx] = "❌ Não Encontrado (Sem precisão de rua)"
-                        falhas_count += 1
+                        if count % 20 == 0 or count == total_pendentes:
+                            prog = 40 + int((count / total_pendentes) * 55)
+                            barra_progresso.progress(prog, text=f"🌍 Geocodificando: {count}/{total_pendentes} concluídos...")
+                            m_web_exato.metric("ArcGIS/Google Exato", f"{web_exato_count}")
+                            m_web_rua.metric("ArcGIS/Google Rua", f"{web_rua_count}")
+                            m_falha.metric("Não Encontrado", f"{falhas_count}")
 
-                    prog_geopy = 60 + int(((k + 1) / total_pendentes) * 40)
-                    barra_progresso.progress(prog_geopy, text=f"🌍 Geopy: {k + 1}/{total_pendentes} processados...")
-                    m_geopy_exato.metric("Geopy Exato/Rua", f"{geopy_rua_count}")
-                    m_geopy_bairro.metric("Geopy Bairro", f"{geopy_bairro_count}")
-                    m_falha.metric("Não Encontrado", f"{falhas_count}")
+            t_total = time.time() - t_inicio
+            barra_progresso.progress(100, text=f"✨ Concluído com sucesso em {t_total:.2f} segundos!")
 
-                salvar_cache_geopy(cache_geopy)
+            # Montagem do Resultado
+            df_resultado = df.copy()
+            if '__cod_ibge' in df_resultado.columns:
+                df_resultado.drop(columns=['__cod_ibge'], inplace=True)
 
-            # Finalização
-            df.drop(columns=['__cod_ibge'], errors='ignore', inplace=True)
-            df['Latitude'] = lats
-            df['Longitude'] = lons
-            df['Status_Precisao'] = status_list
+            df_resultado["Latitude"] = lats
+            df_resultado["Longitude"] = lons
+            df_resultado["Status_Geocodificacao"] = status_list
 
-            caminho_saida = "Coordenadas_Corrigidas_Final.xlsx"
-            df.to_excel(caminho_saida, index=False)
+            total_encontrados = cnefe_exato_count + cnefe_rua_count + web_exato_count + web_rua_count
+            taxa_sucesso = (total_encontrados / total) * 100 if total > 0 else 0
 
-            tempo_total = time.time() - t_inicio
-            barra_progresso.progress(100, text=f"🎉 Concluído em {tempo_total:.2f}s!")
-            st.success(f"Geocodificação concluída em **{tempo_total:.2f} segundos** com garantia de precisão estrita!")
+            st.success(f"""
+            🎉 **Geocodificação Concluída!**
+            - ⏱️ **Tempo Total**: {t_total:.2f}s
+            - 🎯 **Taxa de Sucesso**: {taxa_sucesso:.1f}% ({total_encontrados}/{total})
+            - 🏢 **CNEFE Exato**: {cnefe_exato_count} | 🏢 **CNEFE Rua**: {cnefe_rua_count}
+            - 🌐 **ArcGIS/Google Exato**: {web_exato_count} | 🌐 **ArcGIS/Google Rua**: {web_rua_count}
+            - ❌ **Não Encontrados**: {falhas_count}
+            """)
 
-            # Exibição de resultados e download
-            st.subheader("📊 Resumo e Visualização")
-            st.dataframe(df.head(20))
+            st.dataframe(df_resultado.head(20))
 
-            # Mapa de pontos válidos
-            df_mapa = df[(df['Latitude'] != "") & (df['Longitude'] != "")].copy()
-            if not df_mapa.empty:
-                df_mapa['lat'] = pd.to_numeric(df_mapa['Latitude'], errors='coerce')
-                df_mapa['lon'] = pd.to_numeric(df_mapa['Longitude'], errors='coerce')
-                df_mapa = df_mapa.dropna(subset=['lat', 'lon'])
-                if not df_mapa.empty:
-                    with st.expander("🗺️ Visualizar mapa de pontos geocodificados"):
-                        st.map(df_mapa[['lat', 'lon']])
-
+            # Exportação
+            caminho_saida = "resultado_geocodificado.xlsx"
+            df_resultado.to_excel(caminho_saida, index=False)
             with open(caminho_saida, "rb") as f:
                 st.download_button(
-                    label="📥 Baixar Planilha Corrigida (.xlsx)",
+                    label="📥 Baixar Planilha Geocodificada (.xlsx)",
                     data=f,
-                    file_name="Coordenadas_Corrigidas_Final.xlsx",
+                    file_name="enderecos_geocodificados.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
