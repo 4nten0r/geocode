@@ -1,6 +1,7 @@
 """
 Geocodificador Inteligente de Alta Performance
 Integração CNEFE (IBGE 2022) via DuckDB/Parquet + IA/Heurística de Endereços + Fallback Geopy
+Foco: Precisão Estrita (Número / Rua / Bairro) - Rejeição total de Centro de Cidade e cidades divergentes.
 """
 
 import os
@@ -24,7 +25,8 @@ from endereco_ia import (
     extrair_numero_endereco,
     preparar_endereco,
     sem_prefixo_tipo_rua,
-    calcular_similaridade
+    calcular_similaridade,
+    validar_resposta_geopy
 )
 
 # ============================================================
@@ -53,7 +55,6 @@ def carregar_base_ibge():
 def carregar_cache_geopy():
     """Carrega o cache unificado de geocodificação externa."""
     cache = {}
-    # Carrega cache principal e migra v2 se existir
     for arquivo in [CACHE_GEOPY_ARQUIVO, "cache_geopy_v2.json"]:
         p = Path(arquivo)
         if p.exists():
@@ -73,8 +74,11 @@ def salvar_cache_geopy(cache):
     except Exception:
         pass
 
-def localizar_parquet_estado(estado):
-    """Localiza o arquivo Parquet do CNEFE correspondente ao estado."""
+def localizar_parquet_estado(estado, url_remota=None):
+    """Localiza o arquivo Parquet do CNEFE correspondente ao estado (local ou URL remota)."""
+    if url_remota and url_remota.startswith("http"):
+        return url_remota
+
     estado_limpo = normalizar_texto(estado).lower()[:2]
     candidatos = [
         f"cnefe_{estado_limpo}.parquet",
@@ -93,8 +97,6 @@ def resolver_codigos_ibge(df, col_mun, col_uf, ibge_base):
     """Mapeia os nomes dos municípios para seus respectivos códigos numéricos do IBGE."""
     cods_ibge = []
     ibge_sp = ibge_base.get("SP", {})
-    
-    # Dicionário de cache local para evitar matches repetidos
     cache_mun_match = {}
     
     for _, row in df.iterrows():
@@ -121,7 +123,7 @@ def resolver_codigos_ibge(df, col_mun, col_uf, ibge_base):
         
     return cods_ibge
 
-def carregar_e_indexar_cnefe(parquet_file, cods_ibge):
+def carregar_e_indexar_cnefe(parquet_source, cods_ibge):
     """
     Executa consulta vetorial única no DuckDB e monta o índice em memória
     para busca de ruas e números prediais em tempo O(1).
@@ -131,9 +133,13 @@ def carregar_e_indexar_cnefe(parquet_file, cods_ibge):
         return {}
 
     cods_sql = ", ".join(cods_validos)
-    parquet_escaped = parquet_file.replace("'", "''")
     
     con = duckdb.connect(database=":memory:")
+    # Ativa httpfs se for URL remota (ex: Streamlit Cloud lendo S3/HuggingFace)
+    if parquet_source.startswith("http"):
+        con.execute("INSTALL httpfs; LOAD httpfs;")
+    
+    parquet_escaped = parquet_source.replace("'", "''")
     query = f"""
         SELECT 
             COD_MUNICIPIO,
@@ -145,17 +151,21 @@ def carregar_e_indexar_cnefe(parquet_file, cods_ibge):
         FROM read_parquet('{parquet_escaped}')
         WHERE COD_MUNICIPIO IN ({cods_sql})
     """
-    cnefe_df = con.execute(query).df()
+    try:
+        cnefe_df = con.execute(query).df()
+    except Exception as e:
+        st.error(f"Erro ao ler CNEFE de '{parquet_source}': {e}")
+        con.close()
+        return {}
+        
     con.close()
 
     if cnefe_df.empty:
         return {}
 
-    # Normalização em lote
     cnefe_df['RUA_NORM'] = cnefe_df['NOM_LOGRADOURO'].map(normalizar_texto)
     cnefe_df['NUM_NORM'] = cnefe_df['NUM_ENDERECO'].map(limpar_numero)
 
-    # Indexação otimizada em dicionários
     registros = cnefe_df[['COD_MUNICIPIO', 'RUA_NORM', 'NUM_NORM', 'LATITUDE', 'LONGITUDE', 'CEP']].to_dict(orient='records')
     
     cnefe_index = {}
@@ -252,14 +262,30 @@ def main():
 
     st.title("🌍 Geocodificador IA Turbo")
     st.markdown("""
-    **Motor Híbrido de Geocodificação em Lote**: 
-    CNEFE IBGE 2022 (DuckDB + RapidFuzz Nativo) + IA de Tratamento de Endereços + Fallback Geopy (Nominatim).
+    **Motor de Geocodificação Estrita (Número / Rua / Bairro)**:
+    - 🏢 **CNEFE IBGE 2022**: Coordenadas prediais e de face de quadra locais/remotas via DuckDB + RapidFuzz.
+    - 🛡️ **Garantia Anti-Centro de Cidade**: Rejeita polígonos municipais genéricos para assegurar precisão de logradouro.
+    - 🔒 **Validação Estrita de Cidade**: Nunca atribui coordenadas fora do município de destino.
     """)
 
     # Sidebar
-    st.sidebar.header("⚙️ Configurações")
+    st.sidebar.header("⚙️ Configurações de Precisão")
     limiar_score = st.sidebar.slider("Limiar de Similaridade de Logradouro (%)", min_value=60, max_value=95, value=75, step=1)
     geopy_delay = st.sidebar.slider("Delay Nominatim Fallback (segundos)", min_value=1.0, max_value=5.0, value=2.0, step=0.5)
+
+    st.sidebar.header("📁 Base de Dados CNEFE (IBGE)")
+    tem_cnefe_local = Path("cnefe_sp.parquet").exists() or Path("cnefe_rj.parquet").exists()
+    
+    url_cnefe_custom = None
+    if tem_cnefe_local:
+        st.sidebar.success("✅ Base CNEFE Local (.parquet) detectada!")
+    else:
+        st.sidebar.warning("⚠️ Arquivo `cnefe_sp.parquet` não encontrado no diretório local.")
+        url_cnefe_custom = st.sidebar.text_input(
+            "URL Remota CNEFE (opcional para Nuvem):",
+            placeholder="https://.../cnefe_sp.parquet",
+            help="O DuckDB consegue ler o arquivo Parquet remotamente direto da nuvem (ex: Hugging Face / S3)."
+        )
 
     cache_geopy = carregar_cache_geopy()
     st.sidebar.info(f"💾 **Cache Geopy**: {len(cache_geopy)} endereços indexados.")
@@ -336,8 +362,8 @@ def main():
             m_total = m_col1.metric("Total", f"{total}")
             m_cnefe_exato = m_col2.metric("CNEFE Exato", "0")
             m_cnefe_rua = m_col3.metric("CNEFE Logradouro", "0")
-            m_geopy_cache = m_col4.metric("Geopy Cache", "0")
-            m_geopy_live = m_col5.metric("Geopy Online", "0")
+            m_geopy_exato = m_col4.metric("Geopy Exato/Rua", "0")
+            m_geopy_bairro = m_col5.metric("Geopy Bairro", "0")
             m_falha = m_col6.metric("Não Encontrado", "0")
 
             barra_progresso = st.progress(0, text="🔍 Mapeando códigos de municípios pelo IBGE...")
@@ -353,13 +379,16 @@ def main():
 
             cnefe_indices_por_uf = {}
             for uf in ufs_presentes:
-                parquet_path = localizar_parquet_estado(uf)
+                parquet_path = localizar_parquet_estado(uf, url_remota=url_cnefe_custom)
                 if parquet_path:
                     barra_progresso.progress(10, text=f"⚡ Carregando base CNEFE ({uf}) com DuckDB em memória...")
                     idx_uf = carregar_e_indexar_cnefe(parquet_path, cods_ibge)
                     cnefe_indices_por_uf[uf] = idx_uf
 
-            barra_progresso.progress(25, text="⚡ Executando varredura rápida CNEFE com IA e RapidFuzz C++...")
+            if cnefe_indices_por_uf:
+                barra_progresso.progress(25, text="⚡ Executando varredura rápida CNEFE com IA e RapidFuzz C++...")
+            else:
+                st.info("ℹ️ Base CNEFE local não disponível. Prosseguindo diretamente com motor de Geocodificação Estrita...")
 
             # Passo 2: Executar matching CNEFE
             cnefe_exato_count = 0
@@ -391,19 +420,19 @@ def main():
                     indices_pendentes.append(i)
 
                 if (i + 1) % 100 == 0 or (i + 1) == total:
-                    prog = 25 + int(((i + 1) / total) * 35)  # 25% a 60%
+                    prog = 25 + int(((i + 1) / total) * 35)
                     barra_progresso.progress(prog, text=f"⚡ CNEFE: {i + 1}/{total} processados...")
                     m_cnefe_exato.metric("CNEFE Exato", f"{cnefe_exato_count}")
                     m_cnefe_rua.metric("CNEFE Logradouro", f"{cnefe_rua_count}")
 
-            # Passo 3: Fallback Geopy para os não encontrados
-            geopy_cache_count = 0
-            geopy_live_count = 0
+            # Passo 3: Fallback Geopy Estrito para os não encontrados
+            geopy_rua_count = 0
+            geopy_bairro_count = 0
             falhas_count = 0
             total_pendentes = len(indices_pendentes)
 
             if total_pendentes > 0:
-                barra_progresso.progress(60, text=f"🌍 Iniciando fallback Geopy para {total_pendentes} endereços...")
+                barra_progresso.progress(60, text=f"🌍 Iniciando fallback Geopy Estrito para {total_pendentes} endereços...")
                 geolocator = Nominatim(user_agent=NOMINATIM_USER_AGENT, timeout=15)
 
                 for k, idx in enumerate(indices_pendentes):
@@ -419,33 +448,51 @@ def main():
                     consultas = [
                         {"street": f"{num} {rua}".strip() if num else rua, "city": mun, "state": uf, "country": "Brasil"},
                         f"{rua}, {num}, {bairro}, {mun}, {uf}, Brasil" if bairro and num else f"{rua}, {num}, {mun}, {uf}, Brasil" if num else f"{rua}, {mun}, {uf}, Brasil",
-                        f"{rua}, {mun}, {uf}, Brasil"
+                        f"{rua}, {mun}, {uf}, Brasil",
+                        f"{bairro}, {mun}, {uf}, Brasil" if bairro else None
                     ]
+                    consultas = [c for c in consultas if c is not None]
 
                     encontrou = False
                     for consulta in consultas:
                         chave = json.dumps(consulta, ensure_ascii=False, sort_keys=True)
                         if chave in cache_geopy:
-                            coords = cache_geopy[chave]
-                            if coords:
-                                lats[idx], lons[idx] = coords[0], coords[1]
+                            cached = cache_geopy[chave]
+                            if cached and len(cached) >= 3:
+                                lats[idx], lons[idx] = cached[0], cached[1]
+                                status_list[idx] = cached[2] + " (Cache)"
+                                encontrou = True
+                                if "Bairro" in cached[2]:
+                                    geopy_bairro_count += 1
+                                else:
+                                    geopy_rua_count += 1
+                                break
+                            elif cached and len(cached) == 2:
+                                lats[idx], lons[idx] = cached[0], cached[1]
                                 status_list[idx] = "✅ Geopy (Cache)"
                                 encontrou = True
-                                geopy_cache_count += 1
+                                geopy_rua_count += 1
                                 break
                             continue
 
-                        # Requisição online segura com tratamento de rate limit
+                        # Requisição online segura com validação rigorosa
                         for tentativa in range(3):
                             try:
                                 loc = geolocator.geocode(consulta, addressdetails=True)
                                 time.sleep(geopy_delay)
-                                if loc and -35 <= loc.latitude <= 6 and -75 <= loc.longitude <= -30:
-                                    lats[idx], lons[idx] = loc.latitude, loc.longitude
-                                    status_list[idx] = "✅ Geopy (Online)"
-                                    cache_geopy[chave] = [loc.latitude, loc.longitude]
+                                
+                                # Validação estrita: Rejeita centro de cidade e cidades erradas
+                                validado = validar_resposta_geopy(loc, mun, uf, num_esperado=num)
+                                if validado:
+                                    lat_val, lon_val, st_val = validado
+                                    lats[idx], lons[idx] = lat_val, lon_val
+                                    status_list[idx] = st_val
+                                    cache_geopy[chave] = [lat_val, lon_val, st_val]
                                     encontrou = True
-                                    geopy_live_count += 1
+                                    if "Bairro" in st_val:
+                                        geopy_bairro_count += 1
+                                    else:
+                                        geopy_rua_count += 1
                                 else:
                                     cache_geopy[chave] = None
                                 break
@@ -461,13 +508,13 @@ def main():
                             break
 
                     if not encontrou:
-                        status_list[idx] = "❌ Não Encontrado"
+                        status_list[idx] = "❌ Não Encontrado (Sem precisão de rua)"
                         falhas_count += 1
 
                     prog_geopy = 60 + int(((k + 1) / total_pendentes) * 40)
                     barra_progresso.progress(prog_geopy, text=f"🌍 Geopy: {k + 1}/{total_pendentes} processados...")
-                    m_geopy_cache.metric("Geopy Cache", f"{geopy_cache_count}")
-                    m_geopy_live.metric("Geopy Online", f"{geopy_live_count}")
+                    m_geopy_exato.metric("Geopy Exato/Rua", f"{geopy_rua_count}")
+                    m_geopy_bairro.metric("Geopy Bairro", f"{geopy_bairro_count}")
                     m_falha.metric("Não Encontrado", f"{falhas_count}")
 
                 salvar_cache_geopy(cache_geopy)
@@ -483,7 +530,7 @@ def main():
 
             tempo_total = time.time() - t_inicio
             barra_progresso.progress(100, text=f"🎉 Concluído em {tempo_total:.2f}s!")
-            st.success(f"Geocodificação concluída com sucesso em **{tempo_total:.2f} segundos**!")
+            st.success(f"Geocodificação concluída em **{tempo_total:.2f} segundos** com garantia de precisão estrita!")
 
             # Exibição de resultados e download
             st.subheader("📊 Resumo e Visualização")

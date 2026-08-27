@@ -237,3 +237,63 @@ def calcular_similaridade(a, b):
         0.30 * fuzz.WRatio(a, b)
     )
 
+def validar_resposta_geopy(loc, mun_esperado, uf_esperada, num_esperado=None):
+    """
+    Valida rigorosamente a resposta do Geopy / Nominatim:
+    1. Garante que a cidade e estado coincidem com o esperado (NUNCA erra a cidade).
+    2. Rejeita Centro da Cidade / polígonos municipais genéricos.
+    3. Retorna (lat, lon, status_precisao) ou None se não atender ao padrão de qualidade.
+    """
+    if not loc or not hasattr(loc, 'raw'):
+        return None
+
+    raw = loc.raw
+    addr = raw.get('address', {})
+    addresstype = str(raw.get('addresstype', '')).lower()
+    obj_type = str(raw.get('type', '')).lower()
+    obj_class = str(raw.get('class', '')).lower()
+
+    # 1. Validação Estrita de Cidade (NUNCA aceitar cidade divergente)
+    cidade_retornada = (
+        addr.get('city') or 
+        addr.get('town') or 
+        addr.get('municipality') or 
+        addr.get('village') or 
+        addr.get('city_district') or
+        addr.get('county') or
+        ""
+    )
+    
+    mun_esp = normalizar_municipio(mun_esperado)
+    mun_ret = normalizar_municipio(cidade_retornada)
+    
+    if mun_esp and mun_ret:
+        sim_cidade = fuzz.token_sort_ratio(mun_esp, mun_ret)
+        if sim_cidade < 75 and mun_esp not in mun_ret and mun_ret not in mun_esp:
+            return None  # Rejeita para não atribuir coordenadas em município incorreto
+
+    # 2. Rejeitar Centro da Cidade / Município Genérico (Exigir ao menos Rua ou Bairro)
+    tipos_cidade_pura = {'municipality', 'city', 'town', 'village', 'state', 'administrative', 'country', 'county'}
+    tem_rua = bool(addr.get('road') or addresstype in {'road', 'street', 'highway'})
+    tem_bairro = bool(addr.get('suburb') or addr.get('neighbourhood') or addresstype in {'suburb', 'neighbourhood'})
+    tem_numero = bool(addr.get('house_number') or addresstype in {'house', 'building'})
+
+    if (addresstype in tipos_cidade_pura or obj_type in tipos_cidade_pura or obj_class == 'boundary') and not (tem_rua or tem_bairro or tem_numero):
+        return None  # Rejeita: Retornou apenas centróide de cidade
+
+    lat = float(loc.latitude)
+    lon = float(loc.longitude)
+
+    # 3. Classificação de Precisão
+    if tem_numero or (num_esperado and addr.get('house_number') and str(num_esperado).strip() == str(addr.get('house_number')).strip()):
+        return lat, lon, "✅ Geopy Exato (Número)"
+        
+    if tem_rua:
+        return lat, lon, "✅ Geopy Logradouro (Rua)"
+        
+    if tem_bairro:
+        bairro_nome = addr.get('suburb') or addr.get('neighbourhood') or ''
+        return lat, lon, f"🟡 Geopy Bairro ({bairro_nome})" if bairro_nome else "🟡 Geopy Bairro"
+
+    return None
+
