@@ -281,8 +281,11 @@ def main():
         df = pd.read_excel(caminho_temp)
         st.success(f"Planilha carregada com sucesso! Total de registros: **{len(df)}**")
 
-        # Identificação de colunas
+        # Garante que as colunas do DataFrame sejam únicas
+        df = df.loc[:, ~df.columns.duplicated()].copy()
         colunas = list(df.columns)
+        opcoes_com_nenhum = ["(Não informado)"] + colunas
+
         def detectar_col(opcoes, default_idx=0):
             for i, c in enumerate(colunas):
                 for op in opcoes:
@@ -290,23 +293,36 @@ def main():
                         return i
             return default_idx
 
+        def detectar_col_opcional(opcoes):
+            for i, c in enumerate(colunas):
+                for op in opcoes:
+                    if op.lower() in str(c).lower():
+                        return i + 1  # +1 por causa do '(Não informado)'
+            return 0
+
         st.subheader("📋 Mapeamento de Colunas")
         c1, c2, c3, c4, c5, c6 = st.columns(6)
         with c1:
-            col_rua = st.selectbox("Logradouro / Rua", colunas, index=detectar_col(["rua", "logradouro", "endereco"]))
+            col_rua = st.selectbox("Logradouro / Rua *", colunas, index=detectar_col(["rua", "logradouro", "endereco"]))
         with c2:
-            col_num = st.selectbox("Número", colunas, index=detectar_col(["numero", "num", "nº"]))
+            sel_num = st.selectbox("Número", opcoes_com_nenhum, index=detectar_col_opcional(["numero", "num", "nº"]))
+            col_num = None if sel_num == "(Não informado)" else sel_num
         with c3:
-            col_bairro = st.selectbox("Bairro", colunas, index=detectar_col(["bairro"]))
+            sel_bairro = st.selectbox("Bairro", opcoes_com_nenhum, index=detectar_col_opcional(["bairro"]))
+            col_bairro = None if sel_bairro == "(Não informado)" else sel_bairro
         with c4:
-            col_cep = st.selectbox("CEP", colunas, index=detectar_col(["cep"]))
+            sel_cep = st.selectbox("CEP", opcoes_com_nenhum, index=detectar_col_opcional(["cep"]))
+            col_cep = None if sel_cep == "(Não informado)" else sel_cep
         with c5:
-            col_mun = st.selectbox("Município", colunas, index=detectar_col(["municipio", "cidade"]))
+            col_mun = st.selectbox("Município *", colunas, index=detectar_col(["municipio", "cidade"]))
         with c6:
-            col_uf = st.selectbox("Estado / UF", colunas, index=detectar_col(["estado", "uf"]))
+            sel_uf = st.selectbox("Estado / UF", opcoes_com_nenhum, index=detectar_col_opcional(["estado", "uf"]))
+            col_uf = None if sel_uf == "(Não informado)" else sel_uf
 
+        # Exibe preview sem colunas duplicadas
+        cols_para_exibir = list(dict.fromkeys([c for c in [col_rua, col_num, col_bairro, col_cep, col_mun, col_uf] if c and c in df.columns]))
         with st.expander("🔍 Pré-visualizar dados carregados"):
-            st.dataframe(df[[col_rua, col_num, col_bairro, col_cep, col_mun, col_uf]].head(10))
+            st.dataframe(df[cols_para_exibir].head(10))
 
         if st.button("🚀 Iniciar Geocodificação Turbo", type="primary"):
             t_inicio = time.time()
@@ -358,7 +374,8 @@ def main():
                     uf = "SP"
 
                 cnefe_idx = cnefe_indices_por_uf.get(uf, {})
-                consulta = preparar_endereco(row.get(col_rua, ""), row.get(col_num, ""))
+                num_val = row.get(col_num, "") if col_num else ""
+                consulta = preparar_endereco(row.get(col_rua, ""), num_val)
 
                 res = None
                 if cod and not pd.isna(cod) and int(cod) in cnefe_idx:
@@ -391,7 +408,8 @@ def main():
 
                 for k, idx in enumerate(indices_pendentes):
                     row = df.iloc[idx]
-                    rua_prep = preparar_endereco(row.get(col_rua, ""), row.get(col_num, ""))
+                    num_val = row.get(col_num, "") if col_num else ""
+                    rua_prep = preparar_endereco(row.get(col_rua, ""), num_val)
                     rua = rua_prep["rua"]
                     num = rua_prep["numero"]
                     mun = normalizar_municipio(row.get(col_mun, ""))

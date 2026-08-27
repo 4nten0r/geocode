@@ -55,3 +55,4 @@ git push -u origin main
 2. Conecte sua conta do GitHub.
 3. Selecione o repositório, a branch `main` e o arquivo principal `geocodificador.py`.
 4. Clique em **Deploy**!
+
