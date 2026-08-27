@@ -9,11 +9,12 @@ import sys
 import time
 import json
 import re
+import unicodedata
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 import requests
 
-# Garante que o diretório onde o script está localizado esteja no sys.path (essencial para Streamlit Cloud)
+# Garante que o diretório onde o script está localizado esteja no sys.path
 DIRETORIO_RAIZ = Path(__file__).resolve().parent
 if str(DIRETORIO_RAIZ) not in sys.path:
     sys.path.insert(0, str(DIRETORIO_RAIZ))
@@ -25,27 +26,402 @@ from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderRateLimited, GeocoderTimedOut, GeocoderServiceError
 import streamlit as st
 
-# Importa o módulo de inteligência de endereços e motores de alta precisão
-from endereco_ia import (
-    normalizar_texto,
-    normalizar_municipio,
-    limpar_numero,
-    extrair_numero_endereco,
-    preparar_endereco,
-    sem_prefixo_tipo_rua,
-    calcular_similaridade,
-    consultar_arcgis,
-    consultar_google_maps,
-    validar_resposta_geopy
-)
-
 # ============================================================
 # CONFIGURAÇÕES GLOBAIS
 # ============================================================
 ARQUIVO_IBGE_MUNICIPIOS = str(DIRETORIO_RAIZ / "ibge_municipios.json")
 CACHE_GEOPY_ARQUIVO = str(DIRETORIO_RAIZ / "cache_geopy.json")
-NOMINATIM_USER_AGENT = "GeocodificadorIA_IBGE_Turbo/8.5"
+NOMINATIM_USER_AGENT = "GeocodificadorIA_IBGE_Turbo/9.0"
 DEFAULT_SCORE_CUTOFF = 75
+
+# ============================================================
+# DICIONÁRIOS DE EXPANSÃO E NORMALIZAÇÃO DE LOGRADOUROS
+# ============================================================
+
+PREFIXOS_EXPANSAO = {
+    "R": "RUA", "R.": "RUA", "RUA": "RUA",
+    "AV": "AVENIDA", "AV.": "AVENIDA", "AVN": "AVENIDA", "AVENIDA": "AVENIDA",
+    "AL": "ALAMEDA", "AL.": "ALAMEDA", "ALAMEDA": "ALAMEDA",
+    "TV": "TRAVESSA", "TV.": "TRAVESSA", "TRAV": "TRAVESSA", "TRAV.": "TRAVESSA", "TRAVESSA": "TRAVESSA",
+    "PC": "PRACA", "PC.": "PRACA", "PCA": "PRACA", "PCA.": "PRACA", "PRACA": "PRACA",
+    "JD": "JARDIM", "JD.": "JARDIM", "JARDIM": "JARDIM",
+    "DR": "DOUTOR", "DR.": "DOUTOR", "DRA": "DOUTORA", "DRA.": "DOUTORA", "DOUTOR": "DOUTOR",
+    "PROF": "PROFESSOR", "PROF.": "PROFESSOR", "PROFA": "PROFESSORA", "PROFA.": "PROFESSORA", "PROFESSOR": "PROFESSOR",
+    "CEL": "CORONEL", "CEL.": "CORONEL", "CORONEL": "CORONEL",
+    "EST": "ESTRADA", "EST.": "ESTRADA", "ESTR": "ESTRADA", "ESTR.": "ESTRADA", "ESTRADA": "ESTRADA",
+    "ROD": "RODOVIA", "ROD.": "RODOVIA", "RODOVIA": "RODOVIA",
+    "BR": "BARAO", "BR.": "BARAO", "BARAO": "BARAO", "BAR": "BARAO",
+    "TEN": "TENENTE", "TEN.": "TENENTE", "TENENTE": "TENENTE",
+    "MAJ": "MAJOR", "MAJ.": "MAJOR", "MAJOR": "MAJOR",
+    "CAP": "CAPITAO", "CAP.": "CAPITAO", "CAPITAO": "CAPITAO",
+    "MAL": "MARECHAL", "MAL.": "MARECHAL", "MARECHAL": "MARECHAL",
+    "STA": "SANTA", "STA.": "SANTA", "SANTA": "SANTA",
+    "STO": "SANTO", "STO.": "SANTO", "SANTO": "SANTO", "SAO": "SAO", "S.": "SAO", "S": "SAO",
+    "PQ": "PARQUE", "PQ.": "PARQUE", "PARQUE": "PARQUE",
+    "VL": "VILA", "VL.": "VILA", "VLA": "VILA", "VLA.": "VILA", "VILA": "VILA",
+    "VIEL": "VIELA", "VIEL.": "VIELA", "VIELA": "VIELA",
+    "VE": "VEREADOR", "VE.": "VEREADOR", "VER": "VEREADOR", "VER.": "VEREADOR", "VR": "VEREADOR", "VEREADOR": "VEREADOR",
+    "DEP": "DEPUTADO", "DEP.": "DEPUTADO", "DEPUTADO": "DEPUTADO",
+    "SEN": "SENADOR", "SEN.": "SENADOR", "SENADOR": "SENADOR",
+    "DES": "DESEMBARGADOR", "DES.": "DESEMBARGADOR", "DESEMBARGADOR": "DESEMBARGADOR",
+    "PE": "PADRE", "PE.": "PADRE", "PADRE": "PADRE",
+    "PTO": "PREFEITO", "PTO.": "PREFEITO", "PREFEITO": "PREFEITO",
+    "ENG": "ENGENHEIRO", "ENG.": "ENGENHEIRO", "ENGENHEIRO": "ENGENHEIRO",
+    "LOT": "LOTEAMENTO", "LOT.": "LOTEAMENTO", "LOTEAMENTO": "LOTEAMENTO",
+    "CONJ": "CONJUNTO", "CONJ.": "CONJUNTO", "CONJUNTO": "CONJUNTO",
+    "RES": "RESIDENCIAL", "RES.": "RESIDENCIAL", "RESIDENCIAL": "RESIDENCIAL",
+    "BC": "BECO", "BC.": "BECO", "BECO": "BECO",
+    "PAS": "PASSEIO", "PAS.": "PASSEIO", "PASSEIO": "PASSEIO",
+    "LRG": "LARGO", "LRG.": "LARGO", "LARGO": "LARGO",
+    "SERV": "SERVIDAO", "SERV.": "SERVIDAO", "SERVIDAO": "SERVIDAO",
+}
+
+NUMEROS_EXTENSO = {
+    "01": "UM", "1": "UM", "02": "DOIS", "2": "DOIS", "03": "TRES", "3": "TRES",
+    "04": "QUATRO", "4": "QUATRO", "05": "CINCO", "5": "CINCO", "06": "SEIS", "6": "SEIS",
+    "07": "SETE", "7": "SETE", "08": "OITO", "8": "OITO", "09": "NOVE", "9": "NOVE",
+    "10": "DEZ", "11": "ONZE", "12": "DOZE", "13": "TREZE", "14": "QUATORZE", "15": "QUINZE"
+}
+
+CORRECOES_COMUNS = [
+    (r"\bWHASHINGTON\b", "WASHINGTON"),
+    (r"\bGER\+NIMO\b", "GERONIMO"),
+    (r"\bANT\+NIO\b", "ANTONIO"),
+    (r"\bJO\+O\b", "JOAO"),
+    (r"\bS\+O\b", "SAO"),
+    (r"\bJOS\+\b", "JOSE"),
+    (r"\bIP\-\b", "IPE"),
+    (r"\bIP\+\b", "IPE"),
+]
+
+RUIDOS_REGEX = [
+    r"\bCOMPLEMENTO\s*:.*$",
+    r"\bENTREGAR\s+(?:NO|NA)?\s+NUMERO.*$",
+    r"\bCASA\s*\d*.*$",
+    r"\bCS\s*\d*.*$",
+    r"\bAPTO?\s*\d*.*$",
+    r"\bAPT\s*\d*.*$",
+    r"\bSOBRADO\b.*$",
+    r"\bFUNDOS?\b.*$",
+    r"\bFDS\b.*$",
+    r"\bSALA\s*\d*.*$",
+    r"\bBLOCO\s*[A-Z0-9]*.*$",
+    r"\bBL\s*[A-Z0-9]*.*$",
+    r"\bQUADRA\s*\d+.*$",
+    r"\bQD\s*\d+.*$",
+    r"\bLOTE\s*\d+.*$",
+    r"\bLT\s*\d+.*$",
+    r"\bGALPAO\b.*$",
+    r"\bKM\s*\d+.*$",
+    r"\bCHACARA\s*\d*.*$",
+    r"\bSITIO\s*\d*.*$",
+    r"\bESQUINA\s+COM\b.*$",
+    r"\bESQ\.?\s+COM\b.*$",
+    r"\bPERTO\s+(?:DE|DO|DA)?\b.*$",
+    r"\bPROXIMO\s+(?:A|AO|DA)?\b.*$",
+    r"\bCLINICA\b.*$",
+    r"\bESCRITORIO\b.*$",
+    r"\bBURG(?:ER|UER)\w*\b.*$",
+    r"\bFRIGORIFICO\b.*$",
+    r"\bJAPABURGUER\b.*$",
+]
+
+TIPOS_LOGRADOURO_REGEX = re.compile(
+    r"^(RUA|AVENIDA|ALAMEDA|TRAVESSA|PRACA|ESTRADA|RODOVIA|ROD|VIELA|BECO|LARGO|PRAIA|SERVIDAO|PASSEIO|PARQUE|LOTEAMENTO|CONJUNTO|RESIDENCIAL)\s+",
+    re.I
+)
+
+# ============================================================
+# FUNÇÕES DE TRATAMENTO E NORMALIZAÇÃO DE ENDEREÇOS
+# ============================================================
+
+def normalizar_texto(valor):
+    """Remove acentos, caracteres especiais corrompidos e padroniza em caixa alta."""
+    if valor is None or pd.isna(valor):
+        return ""
+    t = str(valor).upper().strip()
+    t = t.replace("¦+", "C").replace("+", "O").replace("¦", "C").replace("?", "A")
+    for padrao, subst in CORRECOES_COMUNS:
+        t = re.sub(padrao, subst, t, flags=re.I)
+    t = unicodedata.normalize("NFKD", t)
+    t = t.encode("ASCII", "ignore").decode("ASCII")
+    t = re.sub(r"[,;|]+", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+def normalizar_municipio(valor):
+    """Limpa nome do município removendo siglas de estado agregadas (ex: SP-CAMPINAS -> CAMPINAS)."""
+    t = normalizar_texto(valor)
+    t = re.sub(r"^(SP|RJ|MG|PR|MS|GO|BA|ES|SC|RS|MT|PE|CE|PA|PB|AL|SE|RN|PI|MA|TO|RO|AC|AM|RR|AP|DF)[-_\s]+", "", t)
+    t = re.sub(r"[-_\s]+(SP|RJ|MG|PR|MS|GO|BA|ES|SC|RS|MT|PE|CE|PA|PB|AL|SE|RN|PI|MA|TO|RO|AC|AM|RR|AP|DF)$", "", t)
+    t = re.sub(r"\((SP|RJ|MG|PR|MS|GO|BA|ES|SC|RS|MT|PE|CE|PA|PB|AL|SE|RN|PI|MA|TO|RO|AC|AM|RR|AP|DF)\)", "", t)
+    return t.strip()
+
+def limpar_numero(valor):
+    """Padroniza números prediais, removendo strings como S/N, 0, None."""
+    if valor is None or pd.isna(valor):
+        return ""
+    t = str(valor).strip()
+    if t.lower() in {"", "nan", "none", "null", "0", "0.0", "s/n", "sn", "s/nº", "sem numero", "sem nº", "00"}:
+        return ""
+    if re.fullmatch(r"\d+\.0", t):
+        t = t[:-2]
+    return t
+
+def extrair_numero_endereco(rua, numero):
+    """Inteligência para extrair número predial contido dentro do campo de logradouro."""
+    rua = normalizar_texto(rua)
+    num = limpar_numero(numero)
+    
+    if num:
+        rua = re.sub(rf"\b{re.escape(num)}\b", "", rua).strip(" ,-")
+        return rua, num
+
+    # Ex: '8 DE DEZEMBRO 600' -> '8 DE DEZEMBRO', '600'
+    m = re.fullmatch(r"(\d{1,4}\s+DE\s+[A-Z]+)\s+(\d{1,5})", rua)
+    if m:
+        return m.group(1), m.group(2)
+
+    # Ex: 'RUA 15 120' -> 'RUA 15', '120'
+    m = re.fullmatch(r"(RUA\s+\d{1,4})\s+(\d{1,5})", rua)
+    if m:
+        return m.group(1), m.group(2)
+
+    # Ex: 'RUA TAL, 123'
+    m = re.search(r",\s*(\d+[A-Z]?)\b", rua)
+    if m:
+        num = m.group(1)
+        rua = rua[:m.start()].strip(" ,-")
+        return rua, num
+
+    # Ex: 'RUA TAL Nº 123'
+    m = re.search(r"(?:\bN[Oº°]?|\bNUM(?:ERO)?)[\s.:#-]*(\d+[A-Z]?)\b", rua)
+    if m:
+        num = m.group(1)
+        rua = rua[:m.start()].strip(" ,-#")
+        return rua, num
+
+    # Ex: 'AV BRASIL 1500'
+    m = re.search(r"\s+(\d{1,6}[A-Z]?)$", rua)
+    if m:
+        num = m.group(1)
+        rua = rua[:m.start()].strip(" ,-")
+        return rua, num
+
+    return rua, ""
+
+def remover_complementos(texto):
+    """Remove complementos prediais e ruídos de entrega que atrapalham o geocoding."""
+    t = texto
+    for padrao in RUIDOS_REGEX:
+        t = re.sub(padrao, "", t, flags=re.I)
+    return re.sub(r"\s+", " ", t).strip(" ,-.")
+
+def expandir_prefixo(texto):
+    """Expande abreviações como 'R.', 'AV.', 'BR.', 'CEL.', 'VE.'."""
+    t = texto.strip()
+    tokens = t.split()
+    if not tokens:
+        return ""
+    if tokens[0] in PREFIXOS_EXPANSAO:
+        tokens[0] = PREFIXOS_EXPANSAO[tokens[0]]
+    if len(tokens) > 1 and tokens[1] in PREFIXOS_EXPANSAO:
+        tokens[1] = PREFIXOS_EXPANSAO[tokens[1]]
+    return " ".join(tokens)
+
+def sem_prefixo_tipo_rua(texto):
+    """Retorna o nome do logradouro sem o tipo inicial (ex: 'RUA PAULISTA' -> 'PAULISTA')."""
+    return TIPOS_LOGRADOURO_REGEX.sub("", texto).strip()
+
+def preparar_endereco(rua, numero):
+    """Pipeline de IA / Heurística para estruturar um endereço em múltiplas variantes de busca."""
+    rua, numero = extrair_numero_endereco(rua, numero)
+    rua = remover_complementos(rua)
+    rua = expandir_prefixo(rua)
+    rua = re.sub(r"\s+", " ", rua).strip()
+
+    rua_sem_num = re.sub(
+        rf"\s+{re.escape(numero)}[A-Z]?\s*$" if numero else r"$^",
+        "", rua, flags=re.I,
+    ).strip()
+
+    variantes = []
+    def add(v):
+        v = re.sub(r"\s+", " ", v).strip(" ,-")
+        if v and v not in variantes:
+            variantes.append(v)
+
+    add(rua_sem_num)
+    add(expandir_prefixo(rua_sem_num))
+    add(sem_prefixo_tipo_rua(rua_sem_num))
+    add(rua_sem_num.replace("-", " "))
+    add(rua_sem_num.replace("/", " "))
+    
+    sem_conectivos = re.sub(r"\b(DE|DA|DO|DOS|DAS)\b", "", rua_sem_num)
+    sem_conectivos = re.sub(r"\s+", " ", sem_conectivos).strip()
+    if sem_conectivos:
+        add(sem_conectivos)
+        add(sem_prefixo_tipo_rua(sem_conectivos))
+
+    for num_digito, extenso in NUMEROS_EXTENSO.items():
+        if re.search(rf"\b{num_digito}\b", rua_sem_num):
+            add(re.sub(rf"\b{num_digito}\b", extenso, rua_sem_num))
+
+    return {"rua": rua_sem_num, "numero": numero, "variantes": variantes}
+
+def calcular_similaridade(a, b):
+    """Calcula score ponderado de similaridade usando C++ RapidFuzz."""
+    if not a or not b:
+        return 0.0
+    return (
+        0.40 * fuzz.token_set_ratio(a, b) +
+        0.30 * fuzz.token_sort_ratio(a, b) +
+        0.30 * fuzz.WRatio(a, b)
+    )
+
+# ============================================================
+# MOTORES DE GEOCODIFICAÇÃO DE ALTA PRECISÃO
+# ============================================================
+
+def consultar_arcgis(rua_raw, num_raw, bairro_raw, mun_raw, uf_raw, session=None):
+    """
+    Consulta o ArcGIS World Geocoding Service (Esri).
+    Altíssima precisão no Brasil com suporte a números prediais (PointAddress)
+    e validação estrita anti-erro de cidade.
+    """
+    prep = preparar_endereco(rua_raw, num_raw)
+    rua = prep["rua"]
+    num = prep["numero"]
+    mun = normalizar_municipio(mun_raw)
+    uf = normalizar_texto(uf_raw)[:2] if uf_raw else "SP"
+    bairro = normalizar_texto(bairro_raw) if bairro_raw and bairro_raw not in ["(Não informado)", "CENTRO", "RURAL"] else ""
+
+    if not rua or not mun:
+        return None
+
+    consultas = []
+    if num:
+        if bairro:
+            consultas.append(f"{rua}, {num}, {bairro}, {mun}, {uf}, Brasil")
+        consultas.append(f"{rua}, {num}, {mun}, {uf}, Brasil")
+        consultas.append(f"{rua}, {num}, {mun}, Brasil")
+    
+    if bairro:
+        consultas.append(f"{rua}, {bairro}, {mun}, {uf}, Brasil")
+    consultas.append(f"{rua}, {mun}, {uf}, Brasil")
+    consultas.append(f"{rua}, {mun}, Brasil")
+
+    url = "https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates"
+    http = session or requests
+
+    for query_str in consultas:
+        params = {
+            "SingleLine": query_str,
+            "f": "json",
+            "outFields": "Match_addr,Addr_type,City,Subregion,Region,Postal",
+            "maxLocations": 3,
+            "countryCode": "BRA"
+        }
+        try:
+            r = http.get(url, params=params, timeout=6)
+            data = r.json()
+            candidates = data.get("candidates", [])
+            for cand in candidates:
+                score = cand.get("score", 0)
+                if score < 75:
+                    continue
+                attrs = cand.get("attributes", {})
+                addr_type = attrs.get("Addr_type", "")
+                city_ret = normalizar_municipio(attrs.get("City", ""))
+                subregion = normalizar_municipio(attrs.get("Subregion", ""))
+                loc = cand.get("location", {})
+                
+                # Validação Estrita de Cidade
+                sim_cidade = max(fuzz.token_sort_ratio(mun, city_ret), fuzz.token_sort_ratio(mun, subregion))
+                if sim_cidade < 70 and mun not in city_ret and city_ret not in mun:
+                    continue
+
+                lat, lon = loc.get("y"), loc.get("x")
+                if not lat or not lon:
+                    continue
+
+                if addr_type in ["PointAddress", "StreetAddress"]:
+                    return lat, lon, "✅ Exato (Número/Imóvel)", cand.get("address", "")
+                elif addr_type in ["StreetName", "StreetInt"]:
+                    return lat, lon, "✅ Logradouro (Rua)", cand.get("address", "")
+                elif addr_type in ["Locality", "Sublocality", "Neighborhood"] and bairro and fuzz.token_sort_ratio(bairro, addr_type) >= 70:
+                    return lat, lon, f"🟡 Bairro ({bairro})", cand.get("address", "")
+        except Exception:
+            pass
+
+    return None
+
+def consultar_google_maps(rua_raw, num_raw, bairro_raw, mun_raw, uf_raw, api_key, session=None):
+    """
+    Consulta a API oficial do Google Maps (Geocoding API).
+    Precisão máxima absoluta com resolução de coordenadas no telhado (ROOFTOP).
+    """
+    if not api_key:
+        return None
+
+    prep = preparar_endereco(rua_raw, num_raw)
+    rua = prep["rua"]
+    num = prep["numero"]
+    mun = normalizar_municipio(mun_raw)
+    uf = normalizar_texto(uf_raw)[:2] if uf_raw else "SP"
+    bairro = normalizar_texto(bairro_raw) if bairro_raw and bairro_raw not in ["(Não informado)", "CENTRO", "RURAL"] else ""
+
+    if not rua or not mun:
+        return None
+
+    endereco = f"{rua}, {num}".strip(" ,-") if num else rua
+    if bairro:
+        endereco += f", {bairro}"
+    endereco += f", {mun} - {uf}, Brasil"
+
+    url = "https://maps.googleapis.com/maps/api/geocode/json"
+    params = {
+        "address": endereco,
+        "key": api_key,
+        "language": "pt-BR",
+        "region": "br"
+    }
+    http = session or requests
+
+    try:
+        r = http.get(url, params=params, timeout=6)
+        data = r.json()
+        if data.get("status") == "OK" and data.get("results"):
+            res = data["results"][0]
+            loc = res.get("geometry", {}).get("location", {})
+            loc_type = res.get("geometry", {}).get("location_type", "")
+            tipos = set(res.get("types", []))
+            
+            cidade_ok = False
+            for comp in res.get("address_components", []):
+                comp_types = comp.get("types", [])
+                if "administrative_area_level_2" in comp_types or "locality" in comp_types:
+                    cidade_cand = normalizar_municipio(comp.get("long_name", ""))
+                    if fuzz.token_sort_ratio(mun, cidade_cand) >= 70 or mun in cidade_cand or cidade_cand in mun:
+                        cidade_ok = True
+                        break
+
+            if not cidade_ok:
+                return None
+
+            lat = loc.get("lat")
+            lon = loc.get("lng")
+            match_addr = res.get("formatted_address", "")
+
+            if loc_type == "ROOFTOP" or ("street_number" in tipos) or ("premise" in tipos):
+                return lat, lon, "✅ Google Maps Exato (Número)", match_addr
+            elif loc_type in ["RANGE_INTERPOLATED", "GEOMETRIC_CENTER"] and "route" in tipos:
+                return lat, lon, "✅ Google Maps Logradouro (Rua)", match_addr
+            elif "sublocality" in tipos or "neighborhood" in tipos:
+                return lat, lon, "🟡 Google Maps Bairro", match_addr
+    except Exception:
+        pass
+
+    return None
 
 # ============================================================
 # GERENCIAMENTO DE CACHE E BASES DE DADOS
@@ -159,14 +535,12 @@ def resolver_codigos_ibge(df, col_mun, col_uf, ibge_base):
             cache_mun_match[chave] = None
             continue
 
-        # 1. Match direto exato
         if mun_raw in uf_dict:
             cod = uf_dict[mun_raw]
             cods_ibge.append(cod)
             cache_mun_match[chave] = cod
             continue
 
-        # 2. Match Fuzzy
         match = process.extractOne(
             mun_raw,
             list(uf_dict.keys()),
@@ -198,7 +572,6 @@ def carregar_e_indexar_cnefe(caminho_parquet, cods_ibge_unicos):
         pass
 
     try:
-        # Detecta se é o parquet compacto ou completo
         con.execute(f"DESCRIBE SELECT * FROM read_parquet('{caminho_parquet}') LIMIT 1;")
         colunas_parquet = [row[0] for row in con.fetchall()]
         
@@ -271,13 +644,11 @@ def buscar_endereco_no_indice(consulta, mun_cod, cnefe_index, score_cutoff=DEFAU
     if not consulta["rua"] or not ruas_list:
         return None
 
-    # 1. Correspondência exata O(1)
     candidatos = {}
     for v in consulta["variantes"]:
         if v in ruas_dict:
             candidatos[v] = 100.0
 
-    # 2. Se não houver correspondência exata, executa RapidFuzz C++
     if not candidatos:
         for v in consulta["variantes"]:
             matches = process.extract(
@@ -400,7 +771,6 @@ def main():
         df = pd.read_excel(caminho_temp)
         st.success(f"Planilha carregada com sucesso! Total de registros: **{len(df)}**")
 
-        # Garante que as colunas do DataFrame sejam únicas
         df = df.loc[:, ~df.columns.duplicated()].copy()
         colunas = list(df.columns)
         opcoes_com_nenhum = ["(Não informado)"] + colunas
@@ -444,13 +814,10 @@ def main():
             col_uf_escolha = st.selectbox("UF / Estado", opcoes_com_nenhum, index=idx_uf)
             col_uf = None if col_uf_escolha == "(Não informado)" else col_uf_escolha
 
-        # Visualização prévia dos dados mapeados
         cols_preview = [c for c in [col_rua, col_num, col_bairro, col_cep, col_mun, col_uf] if c]
-        # Remove eventuais duplicidades mantendo a ordem
         cols_preview_unicas = list(dict.fromkeys(cols_preview))
         st.dataframe(df[cols_preview_unicas].head(10))
 
-        # Botão de Execução
         if st.button("🚀 Iniciar Geocodificação de Alta Precisão", type="primary"):
             t_inicio = time.time()
             total = len(df)
@@ -458,7 +825,6 @@ def main():
             lons = [""] * total
             status_list = [""] * total
 
-            # Painel de métricas
             m_col1, m_col2, m_col3, m_col4, m_col5, m_col6 = st.columns(6)
             m_total = m_col1.metric("Total", f"{total}")
             m_cnefe_exato = m_col2.metric("CNEFE Exato", "0")
@@ -469,11 +835,9 @@ def main():
 
             barra_progresso = st.progress(0, text="🔍 Mapeando códigos de municípios pelo IBGE...")
 
-            # Passo 1: Mapear códigos IBGE
             cods_ibge = resolver_codigos_ibge(df, col_mun, col_uf, ibge_base)
             df['__cod_ibge'] = cods_ibge
 
-            # Agrupar por Estado para carregar parquets necessários
             ufs_presentes = set(df[col_uf].dropna().map(lambda x: normalizar_texto(x)[:2]).tolist()) if col_uf else {"SP"}
             if not ufs_presentes:
                 ufs_presentes = {"SP"}
@@ -486,7 +850,6 @@ def main():
                     idx_uf = carregar_e_indexar_cnefe(parquet_path, cods_ibge)
                     cnefe_indices_por_uf[uf] = idx_uf
 
-            # Passo 2: Executar matching CNEFE
             cnefe_exato_count = 0
             cnefe_rua_count = 0
             indices_pendentes = []
@@ -521,7 +884,6 @@ def main():
                     m_cnefe_exato.metric("CNEFE Exato", f"{cnefe_exato_count}")
                     m_cnefe_rua.metric("CNEFE Rua", f"{cnefe_rua_count}")
 
-            # Passo 3: Motores de Alta Precisão (Google Maps / ArcGIS World Geocoder)
             web_exato_count = 0
             web_rua_count = 0
             falhas_count = 0
@@ -539,14 +901,12 @@ def main():
                     mun_val = row.get(col_mun, "")
                     uf_val = row.get(col_uf, "SP") if col_uf else "SP"
 
-                    # 1. Tenta Google Maps API se chave fornecida
                     if google_api_key:
                         res_google = consultar_google_maps(rua_val, num_val, bairro_val, mun_val, uf_val, google_api_key, session=session)
                         if res_google:
                             lat, lon, st_p, match_addr = res_google
                             return idx, lat, lon, st_p
 
-                    # 2. Tenta ArcGIS World Geocoder (Alta precisão com número predial)
                     res_arc = consultar_arcgis(rua_val, num_val, bairro_val, mun_val, uf_val, session=session)
                     if res_arc:
                         lat, lon, st_p, match_addr = res_arc
@@ -554,7 +914,6 @@ def main():
 
                     return idx, None, None, None
 
-                # Executa em paralelo com 6 threads
                 with ThreadPoolExecutor(max_workers=6) as executor:
                     futuros = [executor.submit(processar_item_web, idx) for idx in indices_pendentes]
                     for count, fut in enumerate(futuros, 1):
@@ -581,7 +940,6 @@ def main():
             t_total = time.time() - t_inicio
             barra_progresso.progress(100, text=f"✨ Concluído com sucesso em {t_total:.2f} segundos!")
 
-            # Montagem do Resultado
             df_resultado = df.copy()
             if '__cod_ibge' in df_resultado.columns:
                 df_resultado.drop(columns=['__cod_ibge'], inplace=True)
@@ -604,7 +962,6 @@ def main():
 
             st.dataframe(df_resultado.head(20))
 
-            # Exportação
             caminho_saida = "resultado_geocodificado.xlsx"
             df_resultado.to_excel(caminho_saida, index=False)
             with open(caminho_saida, "rb") as f:
