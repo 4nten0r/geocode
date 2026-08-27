@@ -1,7 +1,7 @@
 """
 Geocodificador Inteligente de Alta Performance
 Integração CNEFE (IBGE 2022) via DuckDB/Parquet + ArcGIS World Geocoder + Google Maps API + IA de Endereços
-Foco: Precisão Estrita Nível Google Maps (Número / Rua / Bairro) - Rejeição total de centróides de cidade.
+Otimizado para Lotes Grandes (10.000+ linhas) com Memoização, Conexões Persistentes e Prevenção de OOM.
 """
 
 import os
@@ -11,8 +11,10 @@ import json
 import re
 import unicodedata
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # Garante que o diretório onde o script está localizado esteja no sys.path
 DIRETORIO_RAIZ = Path(__file__).resolve().parent
@@ -22,8 +24,6 @@ if str(DIRETORIO_RAIZ) not in sys.path:
 import pandas as pd
 import duckdb
 from rapidfuzz import process, fuzz
-from geopy.geocoders import Nominatim
-from geopy.exc import GeocoderRateLimited, GeocoderTimedOut, GeocoderServiceError
 import streamlit as st
 
 # ============================================================
@@ -31,7 +31,6 @@ import streamlit as st
 # ============================================================
 ARQUIVO_IBGE_MUNICIPIOS = str(DIRETORIO_RAIZ / "ibge_municipios.json")
 CACHE_GEOPY_ARQUIVO = str(DIRETORIO_RAIZ / "cache_geopy.json")
-NOMINATIM_USER_AGENT = "GeocodificadorIA_IBGE_Turbo/9.0"
 DEFAULT_SCORE_CUTOFF = 75
 
 # ============================================================
@@ -176,31 +175,26 @@ def extrair_numero_endereco(rua, numero):
         rua = re.sub(rf"\b{re.escape(num)}\b", "", rua).strip(" ,-")
         return rua, num
 
-    # Ex: '8 DE DEZEMBRO 600' -> '8 DE DEZEMBRO', '600'
     m = re.fullmatch(r"(\d{1,4}\s+DE\s+[A-Z]+)\s+(\d{1,5})", rua)
     if m:
         return m.group(1), m.group(2)
 
-    # Ex: 'RUA 15 120' -> 'RUA 15', '120'
     m = re.fullmatch(r"(RUA\s+\d{1,4})\s+(\d{1,5})", rua)
     if m:
         return m.group(1), m.group(2)
 
-    # Ex: 'RUA TAL, 123'
     m = re.search(r",\s*(\d+[A-Z]?)\b", rua)
     if m:
         num = m.group(1)
         rua = rua[:m.start()].strip(" ,-")
         return rua, num
 
-    # Ex: 'RUA TAL Nº 123'
     m = re.search(r"(?:\bN[Oº°]?|\bNUM(?:ERO)?)[\s.:#-]*(\d+[A-Z]?)\b", rua)
     if m:
         num = m.group(1)
         rua = rua[:m.start()].strip(" ,-#")
         return rua, num
 
-    # Ex: 'AV BRASIL 1500'
     m = re.search(r"\s+(\d{1,6}[A-Z]?)$", rua)
     if m:
         num = m.group(1)
@@ -268,19 +262,18 @@ def preparar_endereco(rua, numero):
 
     return {"rua": rua_sem_num, "numero": numero, "variantes": variantes}
 
-def calcular_similaridade(a, b):
-    """Calcula score ponderado de similaridade usando C++ RapidFuzz."""
-    if not a or not b:
-        return 0.0
-    return (
-        0.40 * fuzz.token_set_ratio(a, b) +
-        0.30 * fuzz.token_sort_ratio(a, b) +
-        0.30 * fuzz.WRatio(a, b)
-    )
-
 # ============================================================
 # MOTORES DE GEOCODIFICAÇÃO DE ALTA PRECISÃO
 # ============================================================
+
+def criar_sessao_http():
+    """Cria uma sessão HTTP com connection pooling e retries automáticos."""
+    session = requests.Session()
+    retries = Retry(total=2, backoff_factor=0.3, status_forcelist=[500, 502, 503, 504])
+    adapter = HTTPAdapter(pool_connections=25, pool_maxsize=25, max_retries=retries)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
 
 def consultar_arcgis(rua_raw, num_raw, bairro_raw, mun_raw, uf_raw, session=None):
     """
@@ -322,7 +315,7 @@ def consultar_arcgis(rua_raw, num_raw, bairro_raw, mun_raw, uf_raw, session=None
             "countryCode": "BRA"
         }
         try:
-            r = http.get(url, params=params, timeout=6)
+            r = http.get(url, params=params, timeout=5)
             data = r.json()
             candidates = data.get("candidates", [])
             for cand in candidates:
@@ -388,7 +381,7 @@ def consultar_google_maps(rua_raw, num_raw, bairro_raw, mun_raw, uf_raw, api_key
     http = session or requests
 
     try:
-        r = http.get(url, params=params, timeout=6)
+        r = http.get(url, params=params, timeout=5)
         data = r.json()
         if data.get("status") == "OK" and data.get("results"):
             res = data["results"][0]
@@ -437,24 +430,6 @@ def carregar_base_ibge():
         except Exception:
             pass
     return {}
-
-def carregar_cache_geopy():
-    """Carrega o cache de geocodificação offline."""
-    if Path(CACHE_GEOPY_ARQUIVO).exists():
-        try:
-            with open(CACHE_GEOPY_ARQUIVO, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
-
-def salvar_cache_geopy(cache):
-    """Salva o cache em disco de forma segura."""
-    try:
-        with open(CACHE_GEOPY_ARQUIVO, "w", encoding="utf-8") as f:
-            json.dump(cache, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
 
 def obter_url_secret_cnefe(estado):
     """Obtém a URL do CNEFE a partir do st.secrets ou variável de ambiente."""
@@ -654,7 +629,7 @@ def buscar_endereco_no_indice(consulta, mun_cod, cnefe_index, score_cutoff=DEFAU
             matches = process.extract(
                 v, ruas_list,
                 scorer=fuzz.WRatio,
-                limit=6,
+                limit=5,
                 score_cutoff=score_cutoff
             )
             for m_rua, m_score, _ in matches:
@@ -704,11 +679,11 @@ def main():
 
     st.title("🌍 Geocodificador IA Turbo")
     st.markdown("""
-    **Motor Multi-Camadas de Alta Precisão (Nível Google Maps)**:
+    **Motor Multi-Camadas de Alta Performance (Capacidade para 10.000+ linhas)**:
     - 🏢 **Camada 1: CNEFE IBGE 2022**: Busca ultrarrápida vetorial em memória via DuckDB e RapidFuzz.
     - 🗺️ **Camada 2: Google Maps API**: Precisão máxima de coordenadas prediais no telhado (opcional).
-    - 🌐 **Camada 3: ArcGIS World Geocoder (Esri)**: Geocodificador empresarial com localização exata de número predial e rua.
-    - 🛡️ **Garantia Anti-Erro**: Rejeição estrita de centróides de cidade e validação de município de destino.
+    - 🌐 **Camada 3: ArcGIS World Geocoder (Esri)**: Geocodificador empresarial paralelo com localização exata de número predial e rua.
+    - ⚡ **Otimização de Escala**: Memoização inteligente, HTTP Connection Pooling (10 threads) e prevenção de timeouts.
     """)
 
     # Sidebar
@@ -751,9 +726,6 @@ def main():
             st.sidebar.success(f"✅ Base {cnefe_upload.name} carregada com sucesso!")
             st.rerun()
 
-    cache_geopy = carregar_cache_geopy()
-    st.sidebar.info(f"💾 **Cache Offline**: {len(cache_geopy)} endereços indexados.")
-
     ibge_base = carregar_base_ibge()
     if not ibge_base:
         st.sidebar.warning("⚠️ Base de municípios do IBGE não encontrada.")
@@ -768,11 +740,12 @@ def main():
         with open(caminho_temp, "wb") as f:
             f.write(arquivo_upload.getbuffer())
 
-        df = pd.read_excel(caminho_temp)
-        st.success(f"Planilha carregada com sucesso! Total de registros: **{len(df)}**")
+        df_completo = pd.read_excel(caminho_temp)
+        total_linhas_planilha = len(df_completo)
+        st.success(f"Planilha carregada com sucesso! Total de registros: **{total_linhas_planilha}**")
 
-        df = df.loc[:, ~df.columns.duplicated()].copy()
-        colunas = list(df.columns)
+        df_completo = df_completo.loc[:, ~df_completo.columns.duplicated()].copy()
+        colunas = list(df_completo.columns)
         opcoes_com_nenhum = ["(Não informado)"] + colunas
 
         def detectar_col(opcoes, default_idx=0):
@@ -814,11 +787,33 @@ def main():
             col_uf_escolha = st.selectbox("UF / Estado", opcoes_com_nenhum, index=idx_uf)
             col_uf = None if col_uf_escolha == "(Não informado)" else col_uf_escolha
 
+        # Seletor de Escopo de Execução (Tudo vs Intervalo)
+        st.subheader("🎯 Escopo de Processamento")
+        col_escopo1, col_escopo2 = st.columns(2)
+        with col_escopo1:
+            modo_execucao = st.radio(
+                "Escolha o escopo de linhas a processar:",
+                ["Processar Planilha Completa", "Processar Intervalo Específico (Lotes)"],
+                horizontal=True
+            )
+        
+        inicio_linha = 0
+        fim_linha = total_linhas_planilha
+        if modo_execucao == "Processar Intervalo Específico (Lotes)":
+            with col_escopo2:
+                c_ini, c_fim = st.columns(2)
+                with c_ini:
+                    inicio_linha = st.number_input("Linha Inicial (1-indexada):", min_value=1, max_value=total_linhas_planilha, value=1) - 1
+                with c_fim:
+                    fim_linha = st.number_input("Linha Final:", min_value=1, max_value=total_linhas_planilha, value=min(2000, total_linhas_planilha))
+
+        df = df_completo.iloc[inicio_linha:fim_linha].copy().reset_index(drop=True)
+
         cols_preview = [c for c in [col_rua, col_num, col_bairro, col_cep, col_mun, col_uf] if c]
         cols_preview_unicas = list(dict.fromkeys(cols_preview))
         st.dataframe(df[cols_preview_unicas].head(10))
 
-        if st.button("🚀 Iniciar Geocodificação de Alta Precisão", type="primary"):
+        if st.button("🚀 Iniciar Geocodificação Turbo", type="primary"):
             t_inicio = time.time()
             total = len(df)
             lats = [""] * total
@@ -826,15 +821,16 @@ def main():
             status_list = [""] * total
 
             m_col1, m_col2, m_col3, m_col4, m_col5, m_col6 = st.columns(6)
-            m_total = m_col1.metric("Total", f"{total}")
+            m_total = m_col1.metric("Total Lote", f"{total}")
             m_cnefe_exato = m_col2.metric("CNEFE Exato", "0")
             m_cnefe_rua = m_col3.metric("CNEFE Rua", "0")
             m_web_exato = m_col4.metric("ArcGIS/Google Exato", "0")
             m_web_rua = m_col5.metric("ArcGIS/Google Rua", "0")
             m_falha = m_col6.metric("Não Encontrado", "0")
 
-            barra_progresso = st.progress(0, text="🔍 Mapeando códigos de municípios pelo IBGE...")
+            barra_progresso = st.progress(0, text="🔍 Mapeando municípios pelo IBGE...")
 
+            # 1. Mapear códigos IBGE
             cods_ibge = resolver_codigos_ibge(df, col_mun, col_uf, ibge_base)
             df['__cod_ibge'] = cods_ibge
 
@@ -850,9 +846,14 @@ def main():
                     idx_uf = carregar_e_indexar_cnefe(parquet_path, cods_ibge)
                     cnefe_indices_por_uf[uf] = idx_uf
 
+            # 2. Executar matching CNEFE com memoização de alta performance
             cnefe_exato_count = 0
             cnefe_rua_count = 0
             indices_pendentes = []
+            cnefe_memo_cache = {}
+            prep_memo_cache = {}
+
+            ultimo_update_ui = time.time()
 
             for i in range(total):
                 row = df.iloc[i]
@@ -862,12 +863,22 @@ def main():
                     uf = "SP"
 
                 cnefe_idx = cnefe_indices_por_uf.get(uf, {})
-                num_val = row.get(col_num, "") if col_num else ""
-                consulta = preparar_endereco(row.get(col_rua, ""), num_val)
+                rua_raw = str(row.get(col_rua, ""))
+                num_raw = str(row.get(col_num, "")) if col_num else ""
+                
+                chave_cnefe = (cod, rua_raw, num_raw)
+                if chave_cnefe in cnefe_memo_cache:
+                    res = cnefe_memo_cache[chave_cnefe]
+                else:
+                    chave_prep = (rua_raw, num_raw)
+                    if chave_prep not in prep_memo_cache:
+                        prep_memo_cache[chave_prep] = preparar_endereco(rua_raw, num_raw)
+                    consulta = prep_memo_cache[chave_prep]
 
-                res = None
-                if cod and not pd.isna(cod) and int(cod) in cnefe_idx:
-                    res = buscar_endereco_no_indice(consulta, int(cod), cnefe_idx, score_cutoff=limiar_score)
+                    res = None
+                    if cod and not pd.isna(cod) and int(cod) in cnefe_idx:
+                        res = buscar_endereco_no_indice(consulta, int(cod), cnefe_idx, score_cutoff=limiar_score)
+                    cnefe_memo_cache[chave_cnefe] = res
 
                 if res:
                     lats[i], lons[i], status_list[i] = res
@@ -878,46 +889,65 @@ def main():
                 else:
                     indices_pendentes.append(i)
 
-                if (i + 1) % 100 == 0 or (i + 1) == total:
-                    prog = int(((i + 1) / total) * 35)
+                # Atualização throttled da UI a cada 100 linhas ou 1s para evitar saturação
+                agora = time.time()
+                if (i + 1) % 100 == 0 or (agora - ultimo_update_ui) > 1.2 or (i + 1) == total:
+                    prog = int(((i + 1) / total) * 40)
                     barra_progresso.progress(prog, text=f"⚡ CNEFE: {i + 1}/{total} processados...")
                     m_cnefe_exato.metric("CNEFE Exato", f"{cnefe_exato_count}")
                     m_cnefe_rua.metric("CNEFE Rua", f"{cnefe_rua_count}")
+                    ultimo_update_ui = agora
 
+            # 3. Motores de Alta Precisão Web (Google Maps / ArcGIS World Geocoder) em Paralelo
             web_exato_count = 0
             web_rua_count = 0
             falhas_count = 0
             total_pendentes = len(indices_pendentes)
 
             if total_pendentes > 0:
-                barra_progresso.progress(40, text=f"🌍 Geocodificando {total_pendentes} endereços pendentes com precisão Google Maps / ArcGIS...")
-                session = requests.Session()
+                barra_progresso.progress(45, text=f"🌍 Geocodificando {total_pendentes} endereços pendentes com precisão Google Maps / ArcGIS...")
+                session = criar_sessao_http()
+                web_memo_cache = {}
 
                 def processar_item_web(idx):
                     row = df.iloc[idx]
-                    rua_val = row.get(col_rua, "")
-                    num_val = row.get(col_num, "") if col_num else ""
-                    bairro_val = row.get(col_bairro, "") if col_bairro else ""
-                    mun_val = row.get(col_mun, "")
-                    uf_val = row.get(col_uf, "SP") if col_uf else "SP"
+                    rua_val = str(row.get(col_rua, ""))
+                    num_val = str(row.get(col_num, "")) if col_num else ""
+                    bairro_val = str(row.get(col_bairro, "")) if col_bairro else ""
+                    mun_val = str(row.get(col_mun, ""))
+                    uf_val = str(row.get(col_uf, "SP")) if col_uf else "SP"
 
+                    chave_web = (rua_val, num_val, bairro_val, mun_val, uf_val)
+                    if chave_web in web_memo_cache:
+                        return idx, web_memo_cache[chave_web]
+
+                    # 1. Tenta Google Maps API se chave fornecida
                     if google_api_key:
                         res_google = consultar_google_maps(rua_val, num_val, bairro_val, mun_val, uf_val, google_api_key, session=session)
                         if res_google:
                             lat, lon, st_p, match_addr = res_google
-                            return idx, lat, lon, st_p
+                            ret = (lat, lon, st_p)
+                            web_memo_cache[chave_web] = ret
+                            return idx, ret
 
+                    # 2. Tenta ArcGIS World Geocoder (Alta precisão)
                     res_arc = consultar_arcgis(rua_val, num_val, bairro_val, mun_val, uf_val, session=session)
                     if res_arc:
                         lat, lon, st_p, match_addr = res_arc
-                        return idx, lat, lon, st_p
+                        ret = (lat, lon, st_p)
+                        web_memo_cache[chave_web] = ret
+                        return idx, ret
 
-                    return idx, None, None, None
+                    web_memo_cache[chave_web] = (None, None, None)
+                    return idx, (None, None, None)
 
-                with ThreadPoolExecutor(max_workers=6) as executor:
-                    futuros = [executor.submit(processar_item_web, idx) for idx in indices_pendentes]
-                    for count, fut in enumerate(futuros, 1):
-                        idx, lat_val, lon_val, st_val = fut.result()
+                # Processamento com Pool de 10 Threads
+                with ThreadPoolExecutor(max_workers=10) as executor:
+                    futuros = {executor.submit(processar_item_web, idx): idx for idx in indices_pendentes}
+                    count = 0
+                    for fut in as_completed(futuros):
+                        count += 1
+                        idx, (lat_val, lon_val, st_val) = fut.result()
                         if lat_val and lon_val:
                             lats[idx] = lat_val
                             lons[idx] = lon_val
@@ -930,12 +960,14 @@ def main():
                             status_list[idx] = "❌ Não Encontrado (Sem precisão de rua)"
                             falhas_count += 1
 
-                        if count % 20 == 0 or count == total_pendentes:
-                            prog = 40 + int((count / total_pendentes) * 55)
-                            barra_progresso.progress(prog, text=f"🌍 Geocodificando: {count}/{total_pendentes} concluídos...")
+                        agora = time.time()
+                        if count % 50 == 0 or (agora - ultimo_update_ui) > 1.2 or count == total_pendentes:
+                            prog = 45 + int((count / total_pendentes) * 50)
+                            barra_progresso.progress(prog, text=f"🌍 Geocodificando Web: {count}/{total_pendentes} concluídos...")
                             m_web_exato.metric("ArcGIS/Google Exato", f"{web_exato_count}")
                             m_web_rua.metric("ArcGIS/Google Rua", f"{web_rua_count}")
                             m_falha.metric("Não Encontrado", f"{falhas_count}")
+                            ultimo_update_ui = agora
 
             t_total = time.time() - t_inicio
             barra_progresso.progress(100, text=f"✨ Concluído com sucesso em {t_total:.2f} segundos!")
@@ -947,6 +979,9 @@ def main():
             df_resultado["Latitude"] = lats
             df_resultado["Longitude"] = lons
             df_resultado["Status_Geocodificacao"] = status_list
+
+            # Salva na session_state para manter persistência
+            st.session_state["df_resultado"] = df_resultado
 
             total_encontrados = cnefe_exato_count + cnefe_rua_count + web_exato_count + web_rua_count
             taxa_sucesso = (total_encontrados / total) * 100 if total > 0 else 0
