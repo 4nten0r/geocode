@@ -728,22 +728,22 @@ def main():
     if tem_cnefe_local:
         st.sidebar.success("✅ Base CNEFE Local (.parquet) detectada!")
     elif secret_cnefe_sp:
-        st.sidebar.success("🌐 Base CNEFE Nuvem ativa via Streamlit Secrets!")
+        st.sidebar.success("🌐 Base CNEFE Nuvem ativa via Secrets!")
     else:
-        st.sidebar.warning("⚠️ Base CNEFE não detectada localmente.")
-        url_cnefe_custom = st.sidebar.text_input(
-            "1. URL Remota CNEFE SP (Hugging Face / S3):",
-            placeholder="https://.../cnefe_sp.parquet",
-            help="O DuckDB lerá o arquivo Parquet remotamente da nuvem sem precisar baixar tudo."
-        )
-        
-        cnefe_upload = st.sidebar.file_uploader("2. Ou envie o arquivo CNEFE (.parquet) aqui:", type=["parquet"])
-        if cnefe_upload is not None:
-            caminho_salvo = DIRETORIO_RAIZ / cnefe_upload.name
-            with open(caminho_salvo, "wb") as f:
-                f.write(cnefe_upload.getbuffer())
-            st.sidebar.success(f"✅ Base {cnefe_upload.name} carregada com sucesso!")
-            st.rerun()
+        st.sidebar.success("🌐 Base CNEFE Nuvem conectada (Hugging Face / 4nt3n0r)!")
+        with st.sidebar.expander("⚙️ Personalizar Base CNEFE (Opcional)"):
+            url_cnefe_custom = st.text_input(
+                "URL Personalizada CNEFE SP:",
+                placeholder="https://huggingface.co/datasets/4nt3n0r/cnefe22/resolve/main/cnefe_sp_compacto.parquet",
+                help="O DuckDB lerá o arquivo Parquet remotamente da nuvem sem precisar baixar tudo."
+            )
+            cnefe_upload = st.file_uploader("Ou envie outro arquivo CNEFE (.parquet):", type=["parquet"])
+            if cnefe_upload is not None:
+                caminho_salvo = DIRETORIO_RAIZ / cnefe_upload.name
+                with open(caminho_salvo, "wb") as f:
+                    f.write(cnefe_upload.getbuffer())
+                st.sidebar.success(f"✅ Base {cnefe_upload.name} carregada com sucesso!")
+                st.rerun()
 
     ibge_base = carregar_base_ibge()
     if not ibge_base:
