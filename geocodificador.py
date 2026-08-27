@@ -497,7 +497,8 @@ def localizar_parquet_estado(estado, url_remota=None):
         if c.exists():
             return str(c)
             
-    return None
+    # 3. URL padrão do Hugging Face (4nt3n0r/cnefe22)
+    return f"https://huggingface.co/datasets/4nt3n0r/cnefe22/resolve/main/cnefe_{estado_limpo}_compacto.parquet"
 
 # ============================================================
 # MOTOR DE RESOLUÇÃO CNEFE EM LOTE
