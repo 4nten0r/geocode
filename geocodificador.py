@@ -80,11 +80,38 @@ def salvar_cache_geopy(cache):
     except Exception:
         pass
 
+def obter_url_secret_cnefe(estado):
+    """Obtém a URL do CNEFE a partir do st.secrets ou variável de ambiente."""
+    uf = normalizar_texto(estado).upper()[:2]
+    chaves = [f"CNEFE_{uf}_URL", "CNEFE_URL", f"cnefe_{uf.lower()}_url", "cnefe_url"]
+    
+    try:
+        if hasattr(st, "secrets"):
+            for k in chaves:
+                if k in st.secrets:
+                    return str(st.secrets[k]).strip()
+    except Exception:
+        pass
+
+    for k in chaves:
+        val = os.getenv(k)
+        if val and val.startswith("http"):
+            return val.strip()
+            
+    return None
+
 def localizar_parquet_estado(estado, url_remota=None):
-    """Localiza o arquivo Parquet do CNEFE correspondente ao estado (local ou URL remota)."""
+    """Localiza o arquivo Parquet do CNEFE correspondente ao estado (local, URL do Secrets ou URL digitada)."""
+    # 1. URL digitada na interface
     if url_remota and url_remota.startswith("http"):
         return url_remota
 
+    # 2. URL configurada no Streamlit Secrets / Env
+    url_secret = obter_url_secret_cnefe(estado)
+    if url_secret and url_secret.startswith("http"):
+        return url_secret
+
+    # 3. Arquivo local no disco
     estado_limpo = normalizar_texto(estado).lower()[:2]
     candidatos = [
         DIRETORIO_RAIZ / f"cnefe_{estado_limpo}.parquet",
@@ -95,6 +122,7 @@ def localizar_parquet_estado(estado, url_remota=None):
     for c in candidatos:
         if c.exists():
             return str(c)
+            
     return None
 
 # ============================================================
@@ -283,16 +311,19 @@ def main():
 
     st.sidebar.header("📁 Base de Dados CNEFE (IBGE)")
     tem_cnefe_local = (DIRETORIO_RAIZ / "cnefe_sp.parquet").exists() or (DIRETORIO_RAIZ / "cnefe_rj.parquet").exists() or Path("cnefe_sp.parquet").exists()
+    secret_cnefe_sp = obter_url_secret_cnefe("SP")
     
     url_cnefe_custom = None
     if tem_cnefe_local:
         st.sidebar.success("✅ Base CNEFE Local (.parquet) detectada!")
+    elif secret_cnefe_sp:
+        st.sidebar.success("🌐 Base CNEFE Nuvem ativa via Streamlit Secrets!")
     else:
-        st.sidebar.warning("⚠️ Arquivo `cnefe_sp.parquet` não encontrado no diretório local.")
+        st.sidebar.warning("⚠️ Arquivo `cnefe_sp.parquet` não encontrado localmente.")
         url_cnefe_custom = st.sidebar.text_input(
-            "URL Remota CNEFE (opcional para Nuvem):",
+            "URL Remota CNEFE SP (opcional):",
             placeholder="https://.../cnefe_sp.parquet",
-            help="O DuckDB consegue ler o arquivo Parquet remotamente direto da nuvem (ex: Hugging Face / S3)."
+            help="O DuckDB lerá o arquivo Parquet remotamente da nuvem (Hugging Face / S3 / GitHub Releases)."
         )
 
     cache_geopy = carregar_cache_geopy()
