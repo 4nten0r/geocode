@@ -10,6 +10,12 @@ import time
 import json
 import re
 from pathlib import Path
+
+# Garante que o diretório onde o script está localizado esteja no sys.path (essencial para Streamlit Cloud)
+DIRETORIO_RAIZ = Path(__file__).resolve().parent
+if str(DIRETORIO_RAIZ) not in sys.path:
+    sys.path.insert(0, str(DIRETORIO_RAIZ))
+
 import pandas as pd
 import duckdb
 from rapidfuzz import process, fuzz
@@ -32,8 +38,8 @@ from endereco_ia import (
 # ============================================================
 # CONFIGURAÇÕES GLOBAIS
 # ============================================================
-ARQUIVO_IBGE_MUNICIPIOS = "ibge_municipios.json"
-CACHE_GEOPY_ARQUIVO = "cache_geopy.json"
+ARQUIVO_IBGE_MUNICIPIOS = str(DIRETORIO_RAIZ / "ibge_municipios.json")
+CACHE_GEOPY_ARQUIVO = str(DIRETORIO_RAIZ / "cache_geopy.json")
 NOMINATIM_USER_AGENT = "GeocodificadorIA_IBGE_Turbo/8.0"
 DEFAULT_SCORE_CUTOFF = 75
 
@@ -55,7 +61,7 @@ def carregar_base_ibge():
 def carregar_cache_geopy():
     """Carrega o cache unificado de geocodificação externa."""
     cache = {}
-    for arquivo in [CACHE_GEOPY_ARQUIVO, "cache_geopy_v2.json"]:
+    for arquivo in [CACHE_GEOPY_ARQUIVO, str(DIRETORIO_RAIZ / "cache_geopy_v2.json")]:
         p = Path(arquivo)
         if p.exists():
             try:
@@ -81,12 +87,14 @@ def localizar_parquet_estado(estado, url_remota=None):
 
     estado_limpo = normalizar_texto(estado).lower()[:2]
     candidatos = [
-        f"cnefe_{estado_limpo}.parquet",
-        f"cnefe_{estado_limpo.upper()}.parquet"
+        DIRETORIO_RAIZ / f"cnefe_{estado_limpo}.parquet",
+        DIRETORIO_RAIZ / f"cnefe_{estado_limpo.upper()}.parquet",
+        Path(f"cnefe_{estado_limpo}.parquet"),
+        Path(f"cnefe_{estado_limpo.upper()}.parquet")
     ]
     for c in candidatos:
-        if Path(c).exists():
-            return c
+        if c.exists():
+            return str(c)
     return None
 
 # ============================================================
@@ -274,7 +282,7 @@ def main():
     geopy_delay = st.sidebar.slider("Delay Nominatim Fallback (segundos)", min_value=1.0, max_value=5.0, value=2.0, step=0.5)
 
     st.sidebar.header("📁 Base de Dados CNEFE (IBGE)")
-    tem_cnefe_local = Path("cnefe_sp.parquet").exists() or Path("cnefe_rj.parquet").exists()
+    tem_cnefe_local = (DIRETORIO_RAIZ / "cnefe_sp.parquet").exists() or (DIRETORIO_RAIZ / "cnefe_rj.parquet").exists() or Path("cnefe_sp.parquet").exists()
     
     url_cnefe_custom = None
     if tem_cnefe_local:
